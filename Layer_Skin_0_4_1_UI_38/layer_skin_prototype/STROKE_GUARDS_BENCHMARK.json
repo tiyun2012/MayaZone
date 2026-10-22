@@ -1,0 +1,58 @@
+{
+  "scope": "CPU guard/persistence phases only; not native stroke-release latency",
+  "python": "3.12.14",
+  "numpy": "2.3.5",
+  "vertices": 200000,
+  "influences": 16,
+  "weights": 3200000,
+  "painted_vertices": 200,
+  "repeat": 3,
+  "full_tolerance_comparison": {
+    "ui31": {
+      "median_ms": 186.805,
+      "samples_ms": [
+        184.68,
+        189.589,
+        186.805
+      ]
+    },
+    "ui32": {
+      "median_ms": 2.889,
+      "samples_ms": [
+        3.2,
+        2.889,
+        2.793
+      ]
+    }
+  },
+  "one_state_encode": {
+    "ui31_level6": {
+      "median_ms": 715.721,
+      "samples_ms": [
+        715.721,
+        725.085,
+        712.233
+      ]
+    },
+    "ui32_level1_cached_base": {
+      "median_ms": 290.155,
+      "samples_ms": [
+        450.254,
+        290.155,
+        280.056
+      ]
+    }
+  },
+  "metadata_bytes": {
+    "ui31": 8606364,
+    "ui32": 9005196
+  },
+  "staged_command_encode_calls": {
+    "ui31": 2,
+    "ui32": 1
+  },
+  "packed_state_and_composite_estimate_bytes": 51432192,
+  "decoded_cache_cap_bytes": 67108864,
+  "packed_base_cache_cap_bytes": 16777216,
+  "remaining": "Full skin reads, external-edit comparison, state validation/JSON/persistence and write verification remain."
+}

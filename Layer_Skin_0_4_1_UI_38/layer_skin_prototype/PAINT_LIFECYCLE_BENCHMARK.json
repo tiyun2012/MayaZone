@@ -1,0 +1,38 @@
+{
+  "python": "3.12.14",
+  "scope": "CPU recording-API replay after staging: cached surface/array aliases and an unpainted stroke header; excludes real paint/Relax, array diff, commit validation, geometry, Maya events and VP2/GPU.",
+  "cases": [
+    {
+      "vertices": 100000,
+      "influences": 8,
+      "iterations": 500,
+      "seconds": 0.002661,
+      "milliseconds_per_iteration": 0.005323,
+      "counters": {
+        "skin_context_reads": 0,
+        "metadata_reads": 0,
+        "array_reads": 0,
+        "array_writes": 0,
+        "state_encodes": 0,
+        "surface_name_lookups": 0,
+        "parent_queries": 0
+      }
+    },
+    {
+      "vertices": 250000,
+      "influences": 8,
+      "iterations": 500,
+      "seconds": 0.002595,
+      "milliseconds_per_iteration": 0.005191,
+      "counters": {
+        "skin_context_reads": 0,
+        "metadata_reads": 0,
+        "array_reads": 0,
+        "array_writes": 0,
+        "state_encodes": 0,
+        "surface_name_lookups": 0,
+        "parent_queries": 0
+      }
+    }
+  ]
+}

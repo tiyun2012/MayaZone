@@ -1,0 +1,7 @@
+Layer Skin UI 9 skin-file CPU benchmark
+Python 3.12.14 / Linux
+Wall times are one local run, not Maya performance measurements.
+100000 vertices x 16 influences (1600000 dense values, 400000 nonzero): write 0.515432s, read 0.520509s, 156809 bytes; exact weight/DQ round trip.
+250000 vertices x 8 influences (2000000 dense values, 1000000 nonzero): write 0.989374s, read 0.968983s, 377620 bytes; exact weight/DQ round trip.
+Closest surface: 441 source vertices / 800 triangles -> 10000 target vertices / 2 influences: 1.101870s including BVH build; weight error 1.11e-16, DQ error 1.11e-16.
+Archives use four nonzero weights per row. The 2-million dense-value guard remains enabled.

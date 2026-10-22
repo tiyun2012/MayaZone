@@ -1,0 +1,62 @@
+{
+  "python": "3.12.14",
+  "platform": "Linux-6.18.55-x86_64-with-glibc2.39",
+  "numpy": "2.3.5",
+  "repeats": 5,
+  "limitation": "CPU phases and operation counts only. Full Maya painting/release remains unmeasured.",
+  "dirty_rows": [
+    {
+      "ui36_median_ms": 199.7931,
+      "ui37_median_ms": 67.1339,
+      "phase_speedup": 2.98,
+      "vertices": 100000,
+      "influences": 64,
+      "changed_vertices": 65,
+      "candidate_vertices": 100000,
+      "max_vector_block_values": 262144,
+      "scope": "Dirty-row comparison only; excludes locks and native plugs"
+    },
+    {
+      "ui36_median_ms": 208.2688,
+      "ui37_median_ms": 41.0853,
+      "phase_speedup": 5.07,
+      "vertices": 200000,
+      "influences": 16,
+      "changed_vertices": 65,
+      "candidate_vertices": 200000,
+      "max_vector_block_values": 262144,
+      "scope": "Dirty-row comparison only; excludes locks and native plugs"
+    },
+    {
+      "ui36_median_ms": 491.3989,
+      "ui37_median_ms": 81.157,
+      "phase_speedup": 6.05,
+      "vertices": 250000,
+      "influences": 64,
+      "changed_vertices": 65,
+      "candidate_vertices": 250000,
+      "max_vector_block_values": 262144,
+      "scope": "Dirty-row comparison only; excludes locks and native plugs"
+    }
+  ],
+  "connected_geometry": {
+    "ui36_median_ms": 216.6802,
+    "ui37_median_ms": 0.0881,
+    "phase_speedup": 2459.01,
+    "vertices": 250000,
+    "footprint_vertices": 37,
+    "ui36_position_vertices": 250000,
+    "ui37_position_vertices": 57,
+    "scope": "Per-gesture grid construction and first footprint; excludes Maya position/ray API and skin read"
+  },
+  "preview_publication": {
+    "vertices": 250000,
+    "input_events_per_second": 240,
+    "ui36_uploads": 240,
+    "ui37_uploads": 28,
+    "ui36_payload_bytes": 480000000,
+    "ui37_payload_bytes": 56000000,
+    "final_values_match": true,
+    "scope": "Actual Qt publication gate with a CPU buffer adapter; excludes Maya DG/render time"
+  }
+}

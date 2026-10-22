@@ -1,0 +1,63 @@
+{
+  "python": "3.12.14",
+  "scope": "CPU recording-API callback replay; excludes Maya native brush rendering, VP2/GPU and real Maya event ordering",
+  "note": "The unguarded replay reproduces the prior Python callback path; these are not native Maya timings.",
+  "cases": [
+    {
+      "vertices": 100000,
+      "influences": 8,
+      "unguarded_callback_replay": {
+        "updates": 10,
+        "seconds": 0.515632,
+        "milliseconds_per_update": 51.563195,
+        "counters": {
+          "skin_context_reads": 10,
+          "metadata_reads": 10,
+          "array_reads": 10,
+          "array_writes": 10,
+          "state_encodes": 10
+        }
+      },
+      "settings_only_callback_replay": {
+        "updates": 200,
+        "seconds": 0.012382,
+        "milliseconds_per_update": 0.06191,
+        "counters": {
+          "skin_context_reads": 0,
+          "metadata_reads": 0,
+          "array_reads": 0,
+          "array_writes": 0,
+          "state_encodes": 0
+        }
+      }
+    },
+    {
+      "vertices": 250000,
+      "influences": 8,
+      "unguarded_callback_replay": {
+        "updates": 10,
+        "seconds": 2.45355,
+        "milliseconds_per_update": 245.355045,
+        "counters": {
+          "skin_context_reads": 10,
+          "metadata_reads": 10,
+          "array_reads": 10,
+          "array_writes": 10,
+          "state_encodes": 10
+        }
+      },
+      "settings_only_callback_replay": {
+        "updates": 200,
+        "seconds": 0.034194,
+        "milliseconds_per_update": 0.170971,
+        "counters": {
+          "skin_context_reads": 0,
+          "metadata_reads": 0,
+          "array_reads": 0,
+          "array_writes": 0,
+          "state_encodes": 0
+        }
+      }
+    }
+  ]
+}

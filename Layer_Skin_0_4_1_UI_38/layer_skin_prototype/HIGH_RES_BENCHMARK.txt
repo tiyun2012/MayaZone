@@ -1,0 +1,102 @@
+UI 19 pure brush benchmark (2026-10-18)
+{
+  "vertices": 100000,
+  "influences": 8,
+  "stamps": 40,
+  "radius": 12.0,
+  "footprint_vertices_min": 437,
+  "footprint_vertices_max": 452,
+  "changed_vertices": 797,
+  "cached_neighbor_rows": 801,
+  "position_grid_seconds": 0.05038116000002901,
+  "snapshot_seconds": 0.0013151109999398614,
+  "footprint_and_solver_seconds": 0.22526203400002487,
+  "mean_stamp_seconds": 0.005631550850000622,
+  "payload_seconds": 0.0020801150000124835,
+  "excludes": "Maya geometry extraction/raycast, native preview-array upload, skin writes/readback, metadata encoding and viewport/GPU"
+}
+
+Previous release measurements:
+{
+  "flood": [
+    {
+      "vertices": 100000,
+      "influences": 16,
+      "iterations": 3,
+      "changed_vertices": 93985,
+      "solver_seconds": 1.9521692639996218,
+      "validation_seconds": 0.05426831100021445,
+      "palette_seconds": 0.01746453100031431,
+      "roi_1000_seconds": 0.016639205000046786,
+      "excludes": "Maya API, CPV upload, skin writes, encoding and viewport/GPU"
+    },
+    {
+      "vertices": 250000,
+      "influences": 8,
+      "iterations": 3,
+      "changed_vertices": 234748,
+      "solver_seconds": 4.949968517999878,
+      "validation_seconds": 0.10716056999990542,
+      "palette_seconds": 0.054876753999906214,
+      "roi_1000_seconds": 0.02544746600005965,
+      "excludes": "Maya API, CPV upload, skin writes, encoding and viewport/GPU"
+    }
+  ],
+  "brush": {
+    "vertices": 250000,
+    "influences": 8,
+    "stamps": 40,
+    "radius": 12.0,
+    "footprint_vertices_min": 437,
+    "footprint_vertices_max": 452,
+    "changed_vertices": 798,
+    "cached_neighbor_rows": 801,
+    "position_grid_seconds": 0.13633601599985923,
+    "snapshot_seconds": 0.002919120000115072,
+    "footprint_and_solver_seconds": 0.28903187900004923,
+    "mean_stamp_seconds": 0.00722579697500123,
+    "payload_seconds": 0.002544344999932946,
+    "excludes": "Maya geometry extraction/raycast, native preview-array upload, skin writes/readback, metadata encoding and viewport/GPU"
+  },
+  "ui16_clipped_brush": {
+    "vertices": 250000,
+    "influences": 8,
+    "stamps": 40,
+    "radius": 12.0,
+    "footprint_vertices_min": 437,
+    "footprint_vertices_max": 452,
+    "changed_vertices": 798,
+    "cached_neighbor_rows": 801,
+    "position_grid_seconds": 0.12887268800022866,
+    "snapshot_seconds": 0.003531155000018771,
+    "footprint_and_solver_seconds": 0.2584122930002195,
+    "mean_stamp_seconds": 0.006460307325005488,
+    "payload_seconds": 0.0022853310001664795,
+    "excludes": "Maya geometry extraction/raycast, native preview-array upload, skin writes/readback, metadata encoding and viewport/GPU; native projection costs",
+    "projected_checks": 17896,
+    "inside_footprint": 17896,
+    "projection": "synthetic orthographic projected-circle clip; no native M3dView calls"
+  },
+  "ui18_locked_brush": {
+    "vertices": 250000,
+    "influences": 8,
+    "stamps": 40,
+    "radius": 12.0,
+    "footprint_vertices_min": 437,
+    "footprint_vertices_max": 452,
+    "changed_vertices": 786,
+    "cached_neighbor_rows": 801,
+    "position_grid_seconds": 0.1325590869998905,
+    "snapshot_seconds": 0.015486354999893592,
+    "footprint_and_solver_seconds": 0.261442309000131,
+    "mean_stamp_seconds": 0.006536057725003275,
+    "payload_seconds": 0.0025355959999160405,
+    "excludes": "Maya geometry extraction/raycast, native preview-array upload, skin writes/readback, metadata encoding and viewport/GPU",
+    "influence_locks": [
+      "joint1"
+    ],
+    "locked_values_verified": true,
+    "scope": "UI 18 local CPU brush with two unlocked weighted influences; no native projection or Maya execution",
+    "snapshot_includes": "owned benchmark-band setup plus brush staging"
+  }
+}

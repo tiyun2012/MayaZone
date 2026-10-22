@@ -1,0 +1,23 @@
+{
+  "vertices": 100000,
+  "influences": 339,
+  "logical_values": 33900000,
+  "nonzero": 400000,
+  "archive_bytes": 152443,
+  "encoded_layer_bytes": 1687152,
+  "packed_buffer_bytes": 271200000,
+  "stages": {
+    "export_seconds": 0.36756571399973836,
+    "read_seconds": 0.4130017200000111,
+    "id_project_seconds": 0.30414524400021037,
+    "create_base_seconds": 1.0679533319998882,
+    "import_layer_seconds": 2.7317615030001434,
+    "encode_layer_seconds": 2.0938254899997446,
+    "decode_layer_seconds": 2.7450466979998964,
+    "compose_seconds": 0.24155564600005164,
+    "verify_seconds": 6.559604533000311
+  },
+  "verified": true,
+  "excludes": "Maya native reads/writes, binding, Undo/Redo and viewport/GPU",
+  "process_peak_rss_mib": 1051.96484375
+}

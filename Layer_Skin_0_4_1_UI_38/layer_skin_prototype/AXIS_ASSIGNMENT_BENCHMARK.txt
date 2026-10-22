@@ -1,0 +1,8 @@
+Pure Python Joint axis benchmark; no Maya runtime or viewport timing.
+Vertices: 20000; selected joints: 20; generated rows: 19047
+Naive all-joint/all-vertex tests: 400000; actual positive-plane tests: 219057
+First assignment seconds: 0.072084; cached repeat seconds: 0.005902
+Plane tests before/after repeat: 219057 / 219057
+Remaining radius/length/falloff changes did not invalidate the axis cache.
+Matrix planes are computed once per joint; no per-vertex Maya command calls.
+Worst case remains O(vertices * joints) when no vertex is claimed; claimed vertices are removed from later tests.

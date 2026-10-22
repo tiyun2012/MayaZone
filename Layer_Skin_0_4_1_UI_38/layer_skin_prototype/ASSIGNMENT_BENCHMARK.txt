@@ -1,0 +1,5 @@
+Pure Python benchmark; no Maya API, viewport or native playback timing.
+Vertices: 20000 Generated samples: 12080
+First assignment seconds: 0.053980 Cached repeat seconds: 0.009753
+Vertex-distance tests before/after repeat: 15100 15100
+Single-row composition seconds: 1.5e-05 Cache stats: {'items': 2, 'estimated_bytes': 12614400, 'hits': 1, 'builds': 1, 'vertex_tests': 15100}

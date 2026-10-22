@@ -1,0 +1,11 @@
+{
+  "environment": "Linux CPython stand-in for mayapy, real Qt and pip, local wheel; parent started without site-packages",
+  "initial_numpy": "unavailable",
+  "installed_numpy": "1.26.4",
+  "activation": "verified child import then managed folder activation",
+  "current_session_backend": "available after installation without restart",
+  "comparison_tolerance_check": "passed",
+  "qt_heartbeat_ticks": 351,
+  "elapsed_seconds": 3.646,
+  "limitations": "No Maya runtime, Windows DLL loader or production Maya package environment was tested."
+}

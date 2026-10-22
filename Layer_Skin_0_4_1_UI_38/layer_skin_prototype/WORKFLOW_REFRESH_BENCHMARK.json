@@ -1,0 +1,30 @@
+{
+  "python": "3.12.14",
+  "platform": "Linux-6.18.55-x86_64-with-glibc2.39",
+  "repeats": 9,
+  "limitations": "CPU phase fixtures only. Excludes Maya skin reads/writes, command validation, DG, Artisan, viewport and full layer-switch latency.",
+  "layer_summary": {
+    "ui33_median_ms": 383.994042,
+    "ui34_median_ms": 0.010946,
+    "phase_speedup": 35080.76,
+    "vertices": 200000,
+    "influences": 16,
+    "lookups_per_sample": 3,
+    "scope": "Revisiting unchanged Base, Assigned and Painted summaries",
+    "retained_summaries": 3,
+    "weight_scans_per_warm_sample": {
+      "ui33": 3,
+      "ui34": 0
+    }
+  },
+  "selected_relax_topology": {
+    "ui33_median_ms": 6.071948,
+    "ui34_median_ms": 0.00673,
+    "phase_speedup": 902.22,
+    "cached_vertices": 100000,
+    "requested_vertices": 64,
+    "cached_estimated_bytes": 26000000,
+    "native_neighbor_reads_after_warmup": 0,
+    "scope": "64 selected vertices after a whole-mesh topology lookup"
+  }
+}

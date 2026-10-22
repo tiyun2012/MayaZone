@@ -1,0 +1,4362 @@
+# -*- coding: utf-8 -*-
+"""
+Merged Maya Rigging Toolkit
+
+Combines:
+  1) Master Rigging Toolkit (Group SDK / Vertex Constraints / MiniRig Guides)
+  2) Unified Rigging & Skinning Toolkit, including FK/Aim and AimAndReduce By Distance
+
+The Unified toolkit is embedded as a tab in the PySide master window.
+"""
+
+import json
+
+import maya.cmds as cmds
+import maya.OpenMayaUI as omui
+import maya.api.OpenMaya as om
+import maya.api.OpenMayaAnim as oma
+
+from PySide2 import QtWidgets, QtCore
+import shiboken2
+
+# ==============================================================================
+# CENTRALIZED ACTION-BASED UNDO
+# ==============================================================================
+# Maya tools often call many cmds.* operations for one button press.  These
+# helpers make the OUTERMOST user action one undo step.  If a helper function
+# starts another undo block while an action is already running, it simply joins
+# the existing block instead of creating a competing nested chunk.
+_TOOL_UNDO_DEPTH = 0
+
+def _begin_tool_undo(action_name="MasterRiggingAction"):
+    global _TOOL_UNDO_DEPTH
+    if _TOOL_UNDO_DEPTH == 0:
+        cmds.undoInfo(openChunk=True, chunkName=action_name)
+    _TOOL_UNDO_DEPTH += 1
+
+def _end_tool_undo():
+    global _TOOL_UNDO_DEPTH
+    if _TOOL_UNDO_DEPTH <= 0:
+        _TOOL_UNDO_DEPTH = 0
+        return
+    _TOOL_UNDO_DEPTH -= 1
+    if _TOOL_UNDO_DEPTH == 0:
+        cmds.undoInfo(closeChunk=True)
+
+def _non_undoable_cache_write(func):
+    """Keep passive UI/cache bookkeeping out of Maya's scene undo history.
+
+    If called during a real tool action, the cache update joins that action.
+    Otherwise undo recording is temporarily disabled without flushing history.
+    """
+    def _wrapped(*args, **kwargs):
+        if _TOOL_UNDO_DEPTH > 0:
+            return func(*args, **kwargs)
+
+        undo_was_enabled = cmds.undoInfo(query=True, state=True)
+        try:
+            if undo_was_enabled:
+                cmds.undoInfo(stateWithoutFlush=False)
+            return func(*args, **kwargs)
+        finally:
+            if undo_was_enabled:
+                cmds.undoInfo(stateWithoutFlush=True)
+    return _wrapped
+
+
+# ==============================================================================
+# 1. SKIN WEIGHT TRANSFER LOGIC (OpenMaya API v2)
+# ==============================================================================
+def transfer_namespace_weights(mesh, src_ns="B", tgt_ns="A", remove_src=True):
+    if not cmds.objExists(mesh):
+        cmds.warning(f"Mesh '{mesh}' does not exist.")
+        return
+
+    history = cmds.listHistory(mesh, pdo=True) or []
+    skin_clusters = cmds.ls(history, type='skinCluster')
+    if not skin_clusters:
+        cmds.warning(f"No skinCluster found on '{mesh}'.")
+        return
+    
+    skin_name = skin_clusters[0]
+
+    all_infs = cmds.skinCluster(skin_name, query=True, influence=True) or []
+    src_token = f"{src_ns}:"
+    tgt_token = f"{tgt_ns}:"
+    
+    pairs = []
+    for inf in all_infs:
+        if src_token in inf:
+            tgt_inf = inf.replace(src_token, tgt_token)
+            if not cmds.objExists(tgt_inf):
+                cmds.warning(f"Target joint '{tgt_inf}' for '{inf}' does not exist in scene. Skipping.")
+                continue
+            pairs.append((inf, tgt_inf))
+
+    if not pairs:
+        cmds.warning(f"No matching influence joints found with namespace '{src_ns}:'.")
+        return
+
+    _begin_tool_undo("TransferSkinWeights")
+    try:
+        current_infs = cmds.skinCluster(skin_name, query=True, influence=True) or []
+        for src_inf, tgt_inf in pairs:
+            if tgt_inf not in current_infs:
+                cmds.skinCluster(skin_name, edit=True, addInfluence=tgt_inf, weight=0.0)
+
+        sel_list = om.MSelectionList()
+        sel_list.add(skin_name)
+        sel_list.add(mesh)
+
+        skin_obj = sel_list.getDependNode(0)
+        mesh_dag = sel_list.getDagPath(1)
+        
+        if mesh_dag.node().hasFn(om.MFn.kTransform):
+            mesh_dag.extendToShape()
+
+        skin_fn = oma.MFnSkinCluster(skin_obj)
+
+        transfer_indices = []
+        for src_inf, tgt_inf in pairs:
+            src_sel = om.MSelectionList()
+            src_sel.add(src_inf)
+            src_dag = src_sel.getDagPath(0)
+            
+            tgt_sel = om.MSelectionList()
+            tgt_sel.add(tgt_inf)
+            tgt_dag = tgt_sel.getDagPath(0)
+            
+            src_idx = skin_fn.indexForInfluenceObject(src_dag)
+            tgt_idx = skin_fn.indexForInfluenceObject(tgt_dag)
+            transfer_indices.append((src_idx, tgt_idx, src_inf))
+
+        mesh_fn = om.MFnMesh(mesh_dag)
+        num_verts = mesh_fn.numVertices
+
+        single_comp = om.MFnSingleIndexedComponent()
+        components = single_comp.create(om.MFn.kMeshVertComponent)
+        single_comp.addElements(list(range(num_verts)))
+
+        weights, num_infs = skin_fn.getWeights(mesh_dag, components)
+        weights_list = list(weights)
+
+        for v in range(num_verts):
+            base_idx = v * num_infs
+            for src_idx, tgt_idx, _ in transfer_indices:
+                src_weight = weights_list[base_idx + src_idx]
+                if src_weight > 0.0:
+                    weights_list[base_idx + tgt_idx] += src_weight
+                    weights_list[base_idx + src_idx] = 0.0
+
+        all_inf_indices = om.MIntArray(range(num_infs))
+        skin_fn.setWeights(mesh_dag, components, all_inf_indices, om.MDoubleArray(weights_list))
+
+        if remove_src:
+            for src_inf, tgt_inf in pairs:
+                try:
+                    cmds.skinCluster(skin_name, edit=True, removeInfluence=src_inf)
+                except Exception as e:
+                    print(f"Could not remove influence {src_inf}: {e}")
+
+        print(f"Successfully transferred skin weights from '{src_ns}' to '{tgt_ns}' on '{mesh}'.")
+
+    finally:
+        _end_tool_undo()
+
+
+# ==============================================================================
+# 2. CONTROLLER MIRROR LOGIC
+# ==============================================================================
+def copy_color_override(src_ctrl, tgt_ctrl):
+    src_shapes = cmds.listRelatives(src_ctrl, shapes=True, type='nurbsCurve', noIntermediate=True) or []
+    tgt_shapes = cmds.listRelatives(tgt_ctrl, shapes=True, type='nurbsCurve', noIntermediate=True) or []
+
+    if not src_shapes or not tgt_shapes:
+        return
+
+    first_src = src_shapes[0]
+    enabled = cmds.getAttr(f"{first_src}.overrideEnabled")
+
+    for t_shape in tgt_shapes:
+        if not enabled:
+            cmds.setAttr(f"{t_shape}.overrideEnabled", 0)
+            continue
+
+        cmds.setAttr(f"{t_shape}.overrideEnabled", 1)
+        is_rgb = cmds.getAttr(f"{first_src}.overrideRGBColors")
+        cmds.setAttr(f"{t_shape}.overrideRGBColors", is_rgb)
+
+        if is_rgb:
+            rgb_val = cmds.getAttr(f"{first_src}.overrideColorRGB")[0]
+            cmds.setAttr(f"{t_shape}.overrideColorRGB", rgb_val[0], rgb_val[1], rgb_val[2])
+        else:
+            idx_val = cmds.getAttr(f"{first_src}.overrideColor")
+            cmds.setAttr(f"{t_shape}.overrideColor", idx_val)
+
+
+def mirror_ctrl_shape(src_ctrl, tgt_ctrl, force_recreate=False, match_color=False):
+    if not cmds.objExists(src_ctrl) or not cmds.objExists(tgt_ctrl):
+        return False
+
+    src_shapes = cmds.listRelatives(src_ctrl, shapes=True, type='nurbsCurve', noIntermediate=True) or []
+    tgt_shapes = cmds.listRelatives(tgt_ctrl, shapes=True, type='nurbsCurve', noIntermediate=True) or []
+
+    if not src_shapes:
+        cmds.warning(f"No NURBS curve shapes found on source '{src_ctrl}'.")
+        return False
+
+    topology_matches = (len(src_shapes) == len(tgt_shapes)) and not force_recreate
+    if topology_matches:
+        for s_shape, t_shape in zip(src_shapes, tgt_shapes):
+            s_cvs = cmds.ls(f"{s_shape}.cv[*]", flatten=True) or []
+            t_cvs = cmds.ls(f"{t_shape}.cv[*]", flatten=True) or []
+            if len(s_cvs) != len(t_cvs):
+                topology_matches = False
+                break
+
+    if topology_matches:
+        for s_shape, t_shape in zip(src_shapes, tgt_shapes):
+            s_cvs = cmds.ls(f"{s_shape}.cv[*]", flatten=True) or []
+            t_cvs = cmds.ls(f"{t_shape}.cv[*]", flatten=True) or []
+            for s_cv, t_cv in zip(s_cvs, t_cvs):
+                pos = cmds.xform(s_cv, query=True, worldSpace=True, translation=True)
+                mirrored_pos = [-pos[0], pos[1], pos[2]]
+                cmds.xform(t_cv, worldSpace=True, translation=mirrored_pos)
+
+        if match_color:
+            copy_color_override(src_ctrl, tgt_ctrl)
+
+        return True
+    else:
+        return _recreate_and_mirror_shapes(src_ctrl, tgt_ctrl, match_color)
+
+
+def _recreate_and_mirror_shapes(src_ctrl, tgt_ctrl, match_color=False):
+    tgt_shapes = cmds.listRelatives(tgt_ctrl, shapes=True, type='nurbsCurve', noIntermediate=True) or []
+    color_override = None
+    if not match_color and tgt_shapes and cmds.getAttr(f"{tgt_shapes[0]}.overrideEnabled"):
+        color_override = cmds.getAttr(f"{tgt_shapes[0]}.overrideColor")
+
+    temp_dup = cmds.duplicate(src_ctrl, rc=True)[0]
+    children = cmds.listRelatives(temp_dup, children=True, fullPath=True) or []
+    for child in children:
+        if cmds.nodeType(child) != 'nurbsCurve':
+            cmds.delete(child)
+
+    temp_grp = cmds.group(temp_dup, name="temp_mirror_grp#")
+    cmds.xform(temp_grp, worldSpace=True, pvt=[0, 0, 0])
+    cmds.setAttr(f"{temp_grp}.scaleX", -1)
+    cmds.makeIdentity(temp_dup, apply=True, t=True, r=True, s=True, normal=False)
+
+    cmds.parent(temp_dup, tgt_ctrl)
+    cmds.makeIdentity(temp_dup, apply=True, t=True, r=True, s=True, normal=False)
+
+    if tgt_shapes:
+        cmds.delete(tgt_shapes)
+
+    new_shapes = cmds.listRelatives(temp_dup, shapes=True, fullPath=True) or []
+    for shape in new_shapes:
+        cmds.parent(shape, tgt_ctrl, shape=True, relative=True)
+
+    cmds.delete(temp_dup)
+    if cmds.objExists(temp_grp):
+        cmds.delete(temp_grp)
+
+    if match_color:
+        copy_color_override(src_ctrl, tgt_ctrl)
+    elif color_override is not None:
+        updated_shapes = cmds.listRelatives(tgt_ctrl, shapes=True, type='nurbsCurve') or []
+        for s in updated_shapes:
+            cmds.setAttr(f"{s}.overrideEnabled", 1)
+            cmds.setAttr(f"{s}.overrideColor", color_override)
+
+    return True
+
+
+# ==============================================================================
+# 3. UTILITIES LOGIC
+# ==============================================================================
+def swap_and_suffix_old(hide_shape=False):
+    selection = cmds.ls(sl=True)
+    if len(selection) != 2:
+        cmds.warning("Please select exactly 2 objects in order: [1st] Old Object, [2nd] Replacement Object.")
+        return
+
+    src_obj, tgt_obj = selection[0], selection[1]
+
+    orig_src_name = src_obj.split('|')[-1]
+    new_src_name = f"{orig_src_name}_old"
+
+    _begin_tool_undo("SwapNameAndSuffixOld")
+    try:
+        renamed_src = cmds.rename(src_obj, new_src_name)
+        renamed_tgt = cmds.rename(tgt_obj, orig_src_name)
+
+        if hide_shape:
+            shapes = cmds.listRelatives(renamed_src, shapes=True, fullPath=True) or []
+            for s in shapes:
+                cmds.setAttr(f"{s}.visibility", 0)
+
+        cmds.select([renamed_src, renamed_tgt])
+        print(f"Successfully renamed:\n  • '{src_obj}' -> '{renamed_src}'\n  • '{tgt_obj}' -> '{renamed_tgt}'")
+
+    finally:
+        _end_tool_undo()
+
+
+def rename_remove_suffix_from_selection(suffix):
+    selection = cmds.ls(sl=True, long=True) or []
+
+    if not selection:
+        cmds.warning("Please select at least one object.")
+        return []
+
+    suffix = (suffix or "").strip()
+
+    if not suffix:
+        cmds.warning("Please enter a suffix to remove.")
+        return []
+
+    selection.sort(key=lambda x: x.count("|"), reverse=True)
+
+    renamed = []
+    skipped = []
+
+    _begin_tool_undo("RemoveSuffix")
+    try:
+        for node in selection:
+            if not cmds.objExists(node):
+                skipped.append(f"{node} (no longer exists at original path)")
+                continue
+
+            short_name = node.split("|")[-1]
+
+            if not short_name.endswith(suffix):
+                skipped.append(f"{short_name} (suffix not found)")
+                continue
+
+            new_name = short_name[:-len(suffix)]
+
+            if not new_name:
+                skipped.append(f"{short_name} (empty result)")
+                continue
+
+            try:
+                renamed_node = cmds.rename(node, new_name)
+                renamed.append((short_name, renamed_node))
+            except Exception as e:
+                skipped.append(f"{short_name} ({e})")
+
+        if renamed:
+            valid_nodes = [
+                new_name
+                for _, new_name in renamed
+                if cmds.objExists(new_name)
+            ]
+            if valid_nodes:
+                cmds.select(valid_nodes, replace=True)
+
+        print("=" * 60)
+        print(
+            f"REMOVE SUFFIX: '{suffix}' | "
+            f"Selected: {len(selection)} | "
+            f"Renamed: {len(renamed)} | "
+            f"Skipped: {len(skipped)}"
+        )
+
+        return renamed
+
+    finally:
+        _end_tool_undo()
+
+
+def collect_constraints_under_hierarchy(root_node=None, target_grp="constraints_grp"):
+    if not root_node:
+        sel = cmds.ls(sl=True, long=True)
+        if not sel:
+            cmds.warning("Please select a root hierarchy node or specify one.")
+            return []
+        root_node = sel[0]
+
+    if not cmds.objExists(root_node):
+        cmds.warning(f"Root object '{root_node}' does not exist.")
+        return []
+
+    constraint_types = [
+        'parentConstraint', 'pointConstraint', 'orientConstraint',
+        'scaleConstraint', 'aimConstraint', 'poleVectorConstraint',
+        'geometryConstraint', 'normalConstraint', 'tangentConstraint'
+    ]
+
+    all_children = cmds.listRelatives(root_node, allDescendents=True, fullPath=True) or []
+    all_nodes = all_children + cmds.ls(root_node, long=True)
+
+    found_constraints = [
+        node for node in all_nodes 
+        if cmds.nodeType(node) in constraint_types or 'Constraint' in cmds.nodeType(node)
+    ]
+
+    if not found_constraints:
+        cmds.warning(f"No constraint nodes found under hierarchy '{root_node}'.")
+        return []
+
+    moved_constraints = []
+    _begin_tool_undo("CollectConstraints")
+    try:
+        # Group creation belongs to the same user action as the reparenting.
+        if not cmds.objExists(target_grp):
+            target_grp = cmds.group(empty=True, name=target_grp)
+
+        for const in found_constraints:
+            parents = cmds.listRelatives(const, parent=True, fullPath=True)
+            if parents:
+                parent_short = parents[0].split('|')[-1]
+                target_short = target_grp.split('|')[-1]
+                if parent_short == target_short:
+                    continue
+
+            try:
+                reparented = cmds.parent(const, target_grp)
+                moved_constraints.append(reparented[0])
+            except Exception as e:
+                print(f"Could not parent constraint '{const}': {e}")
+
+        print(f"Moved {len(moved_constraints)} constraint node(s) under '{target_grp}'.")
+        return moved_constraints
+
+    finally:
+        _end_tool_undo()
+
+
+# ==============================================================================
+# 4. UNIFIED TOOLKIT UI CLASS
+# ==============================================================================
+class UnifiedRiggingToolkitUI(object):
+    WINDOW_NAME = "UnifiedRiggingToolkitWin"
+
+    def __init__(self):
+        self.fk_chains_data = []
+        self.aim_setups_data = []
+        self.aim_distance_setups_data = []
+        self.create_ui()
+
+    def create_ui(self):
+        if cmds.window(self.WINDOW_NAME, exists=True):
+            cmds.deleteUI(self.WINDOW_NAME)
+
+        self.win = cmds.window(
+            self.WINDOW_NAME,
+            title="Maya Rigging & Skinning Toolkit",
+            widthHeight=(410, 720),
+            sizeable=True
+        )
+
+        main_layout = cmds.columnLayout(adjustableColumn=True)
+        self.tabs = cmds.tabLayout(innerMarginWidth=5, innerMarginHeight=5)
+
+        # TAB 1: Auto Controller
+        tab1 = cmds.columnLayout(adjustableColumn=True, rowSpacing=10, columnOffset=["both", 10])
+        self.build_controller_tab(tab1)
+        cmds.setParent('..')
+
+        # TAB 2: Mirror Shapes
+        tab2 = cmds.columnLayout(adjustableColumn=True, rowSpacing=10, columnOffset=["both", 10])
+        self.build_mirror_tab(tab2)
+        cmds.setParent('..')
+
+        # TAB 3: Weight Transfer
+        tab3 = cmds.columnLayout(adjustableColumn=True, rowSpacing=10, columnOffset=["both", 10])
+        self.build_weight_tab(tab3)
+        cmds.setParent('..')
+
+        # TAB 4: Naming & Utils
+        tab4 = cmds.columnLayout(adjustableColumn=True, rowSpacing=10, columnOffset=["both", 10])
+        self.build_utils_tab(tab4)
+        cmds.setParent('..')
+
+        # TAB 5: FK & Aim Utils
+        tab5 = cmds.columnLayout(adjustableColumn=True, rowSpacing=10, columnOffset=["both", 10])
+        self.build_fk_aim_tab(tab5)
+        cmds.setParent('..')
+
+        cmds.tabLayout(
+            self.tabs,
+            edit=True,
+            tabLabel=[
+                (tab1, 'Auto Controller'),
+                (tab2, 'Mirror Shapes'),
+                (tab3, 'Weight Transfer'),
+                (tab4, 'Naming Utils'),
+                (tab5, 'FK & Aim Utils')
+            ]
+        )
+
+        cmds.showWindow(self.win)
+
+    # --------------------------------------------------------------------------
+    # TAB 1: Auto Controller Builder
+    # --------------------------------------------------------------------------
+    def build_controller_tab(self, parent):
+        cmds.separator(height=6, style='none')
+        cmds.text(label="Auto Controller Generator", font="boldLabelFont", align="center")
+        cmds.separator(height=6, style='single')
+
+        cmds.frameLayout(label=" Control Settings ", marginWidth=8, marginHeight=8)
+        
+        cmds.rowLayout(numberOfColumns=2, columnWidth2=[120, 200])
+        cmds.text(label="Control Shape:")
+        self.shape_menu = cmds.optionMenu()
+        cmds.menuItem(label="Circle (X-Axis)")
+        cmds.menuItem(label="Circle (Y-Axis)")
+        cmds.menuItem(label="Circle (Z-Axis)")
+        cmds.menuItem(label="Cube")
+        cmds.menuItem(label="Sphere")
+        cmds.menuItem(label="Square")
+        cmds.setParent('..')
+
+        cmds.rowLayout(numberOfColumns=2, columnWidth2=[120, 200])
+        cmds.text(label="Control Size:")
+        self.size_field = cmds.floatField(value=3.0, precision=2)
+        cmds.setParent('..')
+
+        # Circle-only settings. Hidden automatically for non-circle shapes.
+        self.circle_options_row = cmds.rowLayout(
+            numberOfColumns=4,
+            columnWidth4=[120, 65, 70, 105],
+            adjustableColumn=4
+        )
+        cmds.text(label="Circle Sections:")
+        self.circle_sections_field = cmds.intField(
+            value=8,
+            minValue=3,
+            maxValue=128
+        )
+        cmds.text(label="Degree:")
+        self.circle_degree_menu = cmds.optionMenu()
+        cmds.menuItem(label="Cubic")
+        cmds.menuItem(label="Linear")
+        cmds.setParent('..')
+
+        # RGB color control + explicit Maya color editor button.
+        self.color_slider = cmds.colorSliderGrp(
+            label="Control Color:",
+            rgb=(1.0, 1.0, 0.0),
+            columnWidth3=[120, 65, 135],
+            adjustableColumn=3
+        )
+
+        cmds.rowLayout(numberOfColumns=2, columnWidth2=[120, 200], adjustableColumn=2)
+        cmds.text(label="")
+        self.color_wheel_btn = cmds.button(
+            label="Open Color Wheel...",
+            command=self.open_ctrl_color_picker
+        )
+        cmds.setParent('..')
+
+        # Shape changes control whether Circle-specific options are shown.
+        cmds.optionMenu(
+            self.shape_menu,
+            edit=True,
+            changeCommand=self.update_circle_shape_options
+        )
+        self.update_circle_shape_options()
+
+        cmds.setParent('..')
+
+        cmds.frameLayout(label=" Hierarchy Attachments (Optional) ", marginWidth=8, marginHeight=8)
+        
+        cmds.rowLayout(numberOfColumns=3, columnWidth3=[80, 170, 70], adjustableColumn=2)
+        cmds.text(label="Parent:")
+        self.parent_obj_field = cmds.textField(placeholderText="Attach root control under...")
+        cmds.button(label="Get Sel", command=self.populate_parent_obj)
+        cmds.setParent('..')
+
+        cmds.rowLayout(numberOfColumns=3, columnWidth3=[80, 170, 70], adjustableColumn=2)
+        cmds.text(label="Child:")
+        self.child_obj_field = cmds.textField(placeholderText="Attach object under ctrl...")
+        cmds.button(label="Get Sel", command=self.populate_child_obj)
+        cmds.setParent('..')
+        cmds.setParent('..')
+
+        cmds.frameLayout(label=" Constraint & Hierarchy Options ", marginWidth=8, marginHeight=8)
+        self.constraint_cb = cmds.checkBox(label="Create Parent Constraint (Ctrl -> Joint)", value=True)
+        self.scale_cb = cmds.checkBox(label="Add Scale Constraint", value=False)
+        self.hierarchy_cb = cmds.checkBox(label="Maintain Controller Hierarchy", value=True)
+        cmds.setParent('..')
+
+        cmds.frameLayout(label=" Constraint Organization ", marginWidth=8, marginHeight=8)
+        self.use_grp_cb = cmds.checkBox(label="Parent Constraints into Group", value=True)
+        cmds.rowLayout(numberOfColumns=3, columnWidth3=[80, 170, 70], adjustableColumn=2)
+        cmds.text(label="Group Name:")
+        self.grp_name_field = cmds.textField(text="constraints_grp")
+        cmds.button(label="Get Sel", command=self.populate_grp_from_sel)
+        cmds.setParent('..')
+        cmds.setParent('..')
+
+        cmds.button(
+            label="Generate Controllers for Selected",
+            height=36,
+            backgroundColor=[0.2, 0.5, 0.4],
+            command=self.run_generator
+        )
+
+        # --------------------------------------------------------------
+        # Add Controller To Layer
+        # --------------------------------------------------------------
+        cmds.separator(height=8, style='none')
+        cmds.frameLayout(
+            label=" Add Controller To Layer ",
+            marginWidth=8,
+            marginHeight=8
+        )
+
+        cmds.rowLayout(numberOfColumns=2, columnWidth2=[120, 220], adjustableColumn=2)
+        cmds.text(label="Controller Set:")
+        cmds.text(label="ControlSet", align="left")
+        cmds.setParent('..')
+
+        cmds.rowLayout(numberOfColumns=2, columnWidth2=[120, 220], adjustableColumn=2)
+        cmds.text(label="Display Layer:")
+        cmds.text(label="AllControllers", align="left")
+        cmds.setParent('..')
+
+        cmds.text(
+            label=(
+                "Any transform in ControlSet that owns a non-intermediate shape "
+                "is treated as a controller."
+            ),
+            align="left",
+            wordWrap=True
+        )
+
+        cmds.button(
+            label="Add ControlSet Controllers To AllControllers",
+            height=32,
+            backgroundColor=[0.25, 0.45, 0.55],
+            command=self.add_controllers_to_layer
+        )
+        cmds.setParent('..')
+
+    def populate_parent_obj(self, *args):
+        sel = cmds.ls(sl=True, type='transform')
+        if sel:
+            cmds.textField(self.parent_obj_field, edit=True, text=sel[0])
+
+    def populate_child_obj(self, *args):
+        sel = cmds.ls(sl=True, type='transform')
+        if sel:
+            cmds.textField(self.child_obj_field, edit=True, text=sel[0])
+
+    def populate_grp_from_sel(self, *args):
+        sel = cmds.ls(sl=True, type='transform')
+        if sel:
+            cmds.textField(self.grp_name_field, edit=True, text=sel[0])
+
+    def update_circle_shape_options(self, *args):
+        """Show Circle-specific settings only when a Circle shape is selected."""
+        shape_type = cmds.optionMenu(self.shape_menu, query=True, value=True)
+        is_circle = shape_type.startswith("Circle (")
+        if hasattr(self, 'circle_options_row') and cmds.layout(self.circle_options_row, exists=True):
+            cmds.rowLayout(
+                self.circle_options_row,
+                edit=True,
+                visible=is_circle,
+                manage=is_circle
+            )
+
+    def open_ctrl_color_picker(self, *args):
+        """Open Maya's color editor and push the chosen RGB back into the UI."""
+        current_rgb = cmds.colorSliderGrp(
+            self.color_slider,
+            query=True,
+            rgb=True
+        )
+        cmds.colorEditor(rgbValue=current_rgb)
+        if cmds.colorEditor(query=True, result=True):
+            rgb = cmds.colorEditor(query=True, rgb=True)
+            cmds.colorSliderGrp(
+                self.color_slider,
+                edit=True,
+                rgb=rgb
+            )
+
+    def create_ctrl_shape(self, shape_type, size, name, circle_sections=8, circle_degree=3):
+        if shape_type == "Circle (X-Axis)":
+            return cmds.circle(
+                normal=(1, 0, 0), radius=size,
+                degree=circle_degree, sections=circle_sections,
+                name=name, constructionHistory=False
+            )[0]
+        elif shape_type == "Circle (Y-Axis)":
+            return cmds.circle(
+                normal=(0, 1, 0), radius=size,
+                degree=circle_degree, sections=circle_sections,
+                name=name, constructionHistory=False
+            )[0]
+        elif shape_type == "Circle (Z-Axis)":
+            return cmds.circle(
+                normal=(0, 0, 1), radius=size,
+                degree=circle_degree, sections=circle_sections,
+                name=name, constructionHistory=False
+            )[0]
+        elif shape_type == "Square":
+            return cmds.circle(normal=(0, 1, 0), radius=size, degree=1, sections=4, name=name, constructionHistory=False)[0]
+        elif shape_type == "Cube":
+            s = size / 2.0
+            points = [
+                (-s, s, s), (s, s, s), (s, -s, s), (-s, -s, s), (-s, s, s),
+                (-s, s, -s), (s, s, -s), (s, -s, -s), (-s, -s, -s), (-s, s, -s),
+                (-s, -s, -s), (-s, -s, s), (s, -s, s), (s, -s, -s), (s, s, -s), (s, s, s)
+            ]
+            return cmds.curve(degree=1, point=points, name=name)
+        elif shape_type == "Sphere":
+            c1 = cmds.circle(normal=(1, 0, 0), radius=size, constructionHistory=False)[0]
+            c2 = cmds.circle(normal=(0, 1, 0), radius=size, constructionHistory=False)[0]
+            c3 = cmds.circle(normal=(0, 0, 1), radius=size, constructionHistory=False)[0]
+            shapes = cmds.listRelatives(c2, shapes=True) + cmds.listRelatives(c3, shapes=True)
+            cmds.parent(shapes, c1, relative=True, shape=True)
+            cmds.delete(c2, c3)
+            return cmds.rename(c1, name)
+
+    def set_ctrl_color(self, obj, color_rgb):
+        """Apply the selected RGB override color to all controller curve shapes."""
+        shapes = cmds.listRelatives(obj, shapes=True, fullPath=True) or []
+        r, g, b = color_rgb
+        for shape in shapes:
+            cmds.setAttr(f"{shape}.overrideEnabled", 1)
+            cmds.setAttr(f"{shape}.overrideRGBColors", 1)
+            cmds.setAttr(f"{shape}.overrideColorRGB", r, g, b)
+
+    def _collect_set_members_recursive(self, set_name, visited=None):
+        """Return members of an objectSet, expanding nested sets safely."""
+        if visited is None:
+            visited = set()
+
+        if set_name in visited:
+            return []
+        visited.add(set_name)
+
+        members = cmds.sets(set_name, query=True) or []
+        result = []
+
+        for member in members:
+            # Nested objectSet: recurse instead of treating the set node as a controller.
+            try:
+                if cmds.objExists(member) and cmds.nodeType(member) == "objectSet":
+                    result.extend(self._collect_set_members_recursive(member, visited))
+                    continue
+            except Exception:
+                pass
+
+            result.append(member)
+
+        return result
+
+    def _as_controller_transform(self, member):
+        """Return a transform only when it directly owns a real shape."""
+        if not member or "." in member:
+            # Components are not controller transforms.
+            return None
+
+        if not cmds.objExists(member):
+            return None
+
+        try:
+            node_type = cmds.nodeType(member)
+        except Exception:
+            return None
+
+        transform = None
+
+        if node_type == "transform":
+            transform = member
+        elif cmds.objectType(member, isAType="shape"):
+            parents = cmds.listRelatives(member, parent=True, fullPath=True) or []
+            if parents:
+                transform = parents[0]
+
+        if not transform or not cmds.objExists(transform):
+            return None
+
+        shapes = cmds.listRelatives(
+            transform,
+            shapes=True,
+            noIntermediate=True,
+            fullPath=True
+        ) or []
+
+        return transform if shapes else None
+
+    def add_controllers_to_layer(self, *args):
+        """Add controller transforms from ControlSet to the AllControllers display layer."""
+        source_set = "ControlSet"
+        layer_name = "AllControllers"
+
+        if not cmds.objExists(source_set) or cmds.nodeType(source_set) != "objectSet":
+            cmds.warning(
+                "Controller set '{}' does not exist or is not an objectSet.".format(source_set)
+            )
+            return
+
+        members = self._collect_set_members_recursive(source_set)
+
+        controllers = []
+        seen = set()
+        for member in members:
+            ctrl = self._as_controller_transform(member)
+            if not ctrl:
+                continue
+
+            long_names = cmds.ls(ctrl, long=True) or [ctrl]
+            ctrl = long_names[0]
+            if ctrl not in seen:
+                seen.add(ctrl)
+                controllers.append(ctrl)
+
+        if not controllers:
+            cmds.warning(
+                "No controller transforms with their own shapes were found in '{}'.".format(
+                    source_set
+                )
+            )
+            return
+
+        _begin_tool_undo("AddControllersToLayer")
+        try:
+            if cmds.objExists(layer_name):
+                if cmds.nodeType(layer_name) != "displayLayer":
+                    cmds.warning(
+                        "A node named '{}' already exists, but it is not a display layer.".format(
+                            layer_name
+                        )
+                    )
+                    return
+            else:
+                cmds.createDisplayLayer(
+                    name=layer_name,
+                    empty=True
+                )
+
+            cmds.editDisplayLayerMembers(
+                layer_name,
+                controllers,
+                noRecurse=True
+            )
+
+            print(
+                "Added {} controller(s) from '{}' to display layer '{}'.".format(
+                    len(controllers), source_set, layer_name
+                )
+            )
+        finally:
+            _end_tool_undo()
+
+    def clean_joint_name(self, jnt_name):
+        short_name = jnt_name.split('|')[-1]
+        for sfx in ["_jnt", "_JNT", "_joint", "_JOINT"]:
+            if short_name.endswith(sfx):
+                return short_name[:-len(sfx)]
+        return short_name
+
+    def run_generator(self, *args):
+        selection = cmds.ls(sl=True, type='joint', long=True)
+        if not selection:
+            cmds.warning("Please select at least one joint.")
+            return
+
+        shape_type = cmds.optionMenu(self.shape_menu, query=True, value=True)
+        size = cmds.floatField(self.size_field, query=True, value=True)
+        circle_sections = cmds.intField(self.circle_sections_field, query=True, value=True)
+        degree_label = cmds.optionMenu(self.circle_degree_menu, query=True, value=True)
+        circle_degree = 3 if degree_label == "Cubic" else 1
+        color_rgb = cmds.colorSliderGrp(self.color_slider, query=True, rgb=True)
+        
+        parent_obj = cmds.textField(self.parent_obj_field, query=True, text=True).strip()
+        child_obj = cmds.textField(self.child_obj_field, query=True, text=True).strip()
+
+        add_parent_const = cmds.checkBox(self.constraint_cb, query=True, value=True)
+        add_scale_const = cmds.checkBox(self.scale_cb, query=True, value=True)
+        maintain_hierarchy = cmds.checkBox(self.hierarchy_cb, query=True, value=True)
+        
+        use_const_grp = cmds.checkBox(self.use_grp_cb, query=True, value=True)
+        const_grp_name = cmds.textField(self.grp_name_field, query=True, text=True).strip()
+
+        if parent_obj and not cmds.objExists(parent_obj):
+            cmds.warning(f"Parent object '{parent_obj}' does not exist in scene.")
+            parent_obj = None
+
+        if child_obj and not cmds.objExists(child_obj):
+            cmds.warning(f"Child object '{child_obj}' does not exist in scene.")
+            child_obj = None
+
+        _begin_tool_undo("GenerateControllers")
+        try:
+            target_const_grp = None
+            if add_parent_const and use_const_grp and const_grp_name:
+                if cmds.objExists(const_grp_name):
+                    target_const_grp = const_grp_name
+                else:
+                    target_const_grp = cmds.group(empty=True, name=const_grp_name)
+
+            joint_to_ctrl_map = {}
+            for jnt in selection:
+                base_name = self.clean_joint_name(jnt)
+                ctrl_name = f"{base_name}_ctrl"
+                offset_name = f"{base_name}_offset_grp"
+                parent_grp_name = f"{base_name}_parent_grp"
+
+                ctrl = self.create_ctrl_shape(
+                    shape_type,
+                    size,
+                    ctrl_name,
+                    circle_sections=circle_sections,
+                    circle_degree=circle_degree
+                )
+                self.set_ctrl_color(ctrl, color_rgb)
+
+                offset_grp = cmds.group(empty=True, name=offset_name)
+                parent_grp = cmds.group(empty=True, name=parent_grp_name)
+
+                cmds.parent(ctrl, offset_grp)
+                cmds.parent(offset_grp, parent_grp)
+
+                cmds.matchTransform(parent_grp, jnt, position=True, rotation=True)
+
+                if add_parent_const:
+                    p_constraint = cmds.parentConstraint(ctrl, jnt, maintainOffset=True)[0]
+                    if target_const_grp:
+                        cmds.parent(p_constraint, target_const_grp)
+
+                    if add_scale_const:
+                        s_constraint = cmds.scaleConstraint(ctrl, jnt, maintainOffset=True)[0]
+                        if target_const_grp:
+                            cmds.parent(s_constraint, target_const_grp)
+
+                joint_to_ctrl_map[jnt] = (parent_grp, ctrl)
+
+            if maintain_hierarchy:
+                for jnt, (parent_grp, ctrl) in joint_to_ctrl_map.items():
+                    parent_jnt = cmds.listRelatives(jnt, parent=True, type='joint', fullPath=True)
+                    if parent_jnt and parent_jnt[0] in joint_to_ctrl_map:
+                        _, parent_ctrl = joint_to_ctrl_map[parent_jnt[0]]
+                        cmds.parent(parent_grp, parent_ctrl)
+
+            if parent_obj:
+                for jnt, (parent_grp, ctrl) in joint_to_ctrl_map.items():
+                    parent_jnt = cmds.listRelatives(jnt, parent=True, type='joint', fullPath=True)
+                    is_root = True
+                    if maintain_hierarchy and parent_jnt and parent_jnt[0] in joint_to_ctrl_map:
+                        is_root = False
+                    if is_root:
+                        cmds.parent(parent_grp, parent_obj)
+
+            if child_obj:
+                leaf_ctrl = None
+                if maintain_hierarchy:
+                    for jnt, (parent_grp, ctrl) in joint_to_ctrl_map.items():
+                        child_jnts = cmds.listRelatives(jnt, children=True, type='joint', fullPath=True) or []
+                        has_child_in_sel = any(cj in joint_to_ctrl_map for cj in child_jnts)
+                        if not has_child_in_sel:
+                            leaf_ctrl = ctrl
+                            break
+                
+                if not leaf_ctrl:
+                    leaf_ctrl = list(joint_to_ctrl_map.values())[-1][1]
+
+                if leaf_ctrl:
+                    cmds.parent(child_obj, leaf_ctrl)
+
+            cmds.select([data[1] for data in joint_to_ctrl_map.values()])
+            print(f"Successfully generated controllers for {len(selection)} joints.")
+        finally:
+            _end_tool_undo()
+
+    # --------------------------------------------------------------------------
+    # TAB 2: Shape Mirroring Builder
+    # --------------------------------------------------------------------------
+    def build_mirror_tab(self, parent):
+        cmds.separator(height=6, style='none')
+        cmds.text(label="Mirror Control Shapes across YZ Plane", font="boldLabelFont", align="center")
+        cmds.separator(height=6, style='single')
+
+        cmds.rowLayout(numberOfColumns=2, columnWidth2=[165, 165])
+        cmds.columnLayout(adjustableColumn=True)
+        cmds.text(label="Search (Source):", align="left")
+        self.search_field = cmds.textField(text="L_")
+        cmds.setParent('..')
+
+        cmds.columnLayout(adjustableColumn=True)
+        cmds.text(label="Replace (Target):", align="left")
+        self.replace_field = cmds.textField(text="R_")
+        cmds.setParent('..')
+        cmds.setParent('..')
+
+        self.force_recreate_cb = cmds.checkBox(label="Force Recreate Shapes (if CV counts differ)", value=False)
+        self.match_color_cb = cmds.checkBox(label="Match Source Color (Copy display color)", value=False)
+
+        cmds.separator(height=6, style='single')
+
+        cmds.button(label="Mirror Selected Controls", height=36, backgroundColor=[0.25, 0.45, 0.55], command=self.run_mirror)
+        cmds.button(label="Swap Search & Replace (R_ -> L_)", height=24, command=self.swap_fields)
+
+    def swap_fields(self, *args):
+        s_val = cmds.textField(self.search_field, query=True, text=True)
+        r_val = cmds.textField(self.replace_field, query=True, text=True)
+        cmds.textField(self.search_field, edit=True, text=r_val)
+        cmds.textField(self.replace_field, edit=True, text=s_val)
+
+    def run_mirror(self, *args):
+        selection = cmds.ls(sl=True, type='transform')
+        search_str = cmds.textField(self.search_field, query=True, text=True).strip()
+        replace_str = cmds.textField(self.replace_field, query=True, text=True).strip()
+        force_recreate = cmds.checkBox(self.force_recreate_cb, query=True, value=True)
+        match_color = cmds.checkBox(self.match_color_cb, query=True, value=True)
+
+        if not selection:
+            cmds.warning("Please select at least one control or a pair of controls.")
+            return
+
+        _begin_tool_undo("MirrorControls")
+        count = 0
+        try:
+            if len(selection) == 2 and (search_str not in selection[0]):
+                if mirror_ctrl_shape(selection[0], selection[1], force_recreate, match_color):
+                    count += 1
+            else:
+                for src in selection:
+                    if search_str in src:
+                        tgt = src.replace(search_str, replace_str)
+                        if cmds.objExists(tgt):
+                            if mirror_ctrl_shape(src, tgt, force_recreate, match_color):
+                                count += 1
+                        else:
+                            cmds.warning(f"Target object '{tgt}' not found for '{src}'.")
+                    else:
+                        cmds.warning(f"Search prefix/suffix '{search_str}' not found in '{src}'.")
+
+            print(f"Successfully mirrored {count} controller shape(s) across YZ plane.")
+        finally:
+            _end_tool_undo()
+
+    # --------------------------------------------------------------------------
+    # TAB 3: Skin Weight Transfer Builder
+    # --------------------------------------------------------------------------
+    def build_weight_tab(self, parent):
+        cmds.separator(height=6, style='none')
+        cmds.text(label="Namespace Weight Transfer", font="boldLabelFont", align="center")
+        cmds.separator(height=6, style='single')
+
+        cmds.rowLayout(numberOfColumns=3, columnWidth3=[90, 170, 70], adjustableColumn=2)
+        cmds.text(label="Target Mesh:")
+        self.mesh_field = cmds.textField(placeholderText="Select mesh...")
+        cmds.button(label="Get Sel", command=self.populate_mesh)
+        cmds.setParent('..')
+
+        cmds.rowLayout(numberOfColumns=2, columnWidth2=[165, 165])
+        cmds.columnLayout(adjustableColumn=True)
+        cmds.text(label="Source Namespace:", align='left')
+        self.src_field = cmds.textField(text="B")
+        cmds.setParent('..')
+
+        cmds.columnLayout(adjustableColumn=True)
+        cmds.text(label="Target Namespace:", align='left')
+        self.tgt_field = cmds.textField(text="A")
+        cmds.setParent('..')
+        cmds.setParent('..')
+
+        self.remove_cb = cmds.checkBox(label="Remove Source (B) Joints from SkinCluster", value=True)
+
+        cmds.separator(height=6, style='single')
+
+        cmds.button(label="Transfer Weights", height=36, backgroundColor=[0.25, 0.45, 0.35], command=self.run_transfer)
+        self.populate_mesh()
+
+    def populate_mesh(self, *args):
+        sel = cmds.ls(sl=True, type='transform')
+        if sel:
+            cmds.textField(self.mesh_field, edit=True, text=sel[0])
+
+    def run_transfer(self, *args):
+        mesh = cmds.textField(self.mesh_field, query=True, text=True).strip()
+        src_ns = cmds.textField(self.src_field, query=True, text=True).strip()
+        tgt_ns = cmds.textField(self.tgt_field, query=True, text=True).strip()
+        remove_src = cmds.checkBox(self.remove_cb, query=True, value=True)
+
+        if not mesh or not src_ns or not tgt_ns:
+            cmds.warning("Please populate Mesh and both Source/Target namespaces.")
+            return
+
+        transfer_namespace_weights(mesh, src_ns, tgt_ns, remove_src)
+
+    # --------------------------------------------------------------------------
+    # TAB 4: Naming & Utilities Builder
+    # --------------------------------------------------------------------------
+    def build_utils_tab(self, parent):
+        cmds.separator(height=6, style='none')
+        cmds.text(label="Naming & Hierarchy Utilities", font="boldLabelFont", align="center")
+        cmds.separator(height=6, style='single')
+
+        # Feature 1: Name Swap
+        cmds.frameLayout(label=" Replace Name & Suffix Old ", marginWidth=8, marginHeight=8)
+        cmds.text(
+            label="1. Select Old Object\n2. Shift-Select Replacement Object\n3. Click button below:",
+            align="left"
+        )
+        cmds.separator(height=6, style='none')
+
+        self.hide_old_shape_cb = cmds.checkBox(
+            label="Hide Shape Node(s) of Old Object",
+            value=True
+        )
+
+        cmds.separator(height=6, style='none')
+
+        cmds.button(
+            label="Swap Name & Add '_old' to 1st",
+            height=34,
+            backgroundColor=[0.55, 0.35, 0.25],
+            command=self.run_swap_old
+        )
+        cmds.setParent('..')
+
+        # Feature 2: Rename by Removing Suffix
+        cmds.frameLayout(
+            label=" Rename Selected Objects - Remove Suffix ",
+            marginWidth=8,
+            marginHeight=8
+        )
+
+        cmds.text(
+            label="Rename ALL selected objects by removing this suffix from the END of each name:",
+            align="left",
+            wordWrap=True
+        )
+
+        cmds.rowLayout(
+            numberOfColumns=2,
+            columnWidth2=[110, 210],
+            adjustableColumn=2
+        )
+        cmds.text(label="Suffix to Remove:")
+        self.remove_suffix_field = cmds.textField(text="_ctrl")
+        cmds.setParent('..')
+
+        cmds.separator(height=6, style='none')
+
+        cmds.button(
+            label="Rename ALL Selected - Remove Suffix",
+            height=34,
+            backgroundColor=[0.45, 0.35, 0.25],
+            command=self.run_remove_suffix
+        )
+        cmds.setParent('..')
+
+        # Feature 3: Constraint Collector
+        cmds.frameLayout(label=" Hierarchy Constraint Collector ", marginWidth=8, marginHeight=8)
+        
+        cmds.rowLayout(numberOfColumns=3, columnWidth3=[90, 160, 70], adjustableColumn=2)
+        cmds.text(label="Root Node:")
+        self.root_node_field = cmds.textField(placeholderText="Leave empty to use selection...")
+        cmds.button(label="Get Sel", command=self.populate_root_node)
+        cmds.setParent('..')
+
+        cmds.rowLayout(numberOfColumns=3, columnWidth3=[90, 160, 70], adjustableColumn=2)
+        cmds.text(label="Target Group:")
+        self.collect_grp_field = cmds.textField(text="constraints_grp")
+        cmds.button(label="Get Sel", command=self.populate_collect_grp)
+        cmds.setParent('..')
+
+        cmds.separator(height=6, style='none')
+
+        cmds.button(
+            label="Collect Hierarchy Constraints to Group",
+            height=34,
+            backgroundColor=[0.25, 0.45, 0.55],
+            command=self.run_collect_constraints
+        )
+        cmds.setParent('..')
+
+    def populate_root_node(self, *args):
+        sel = cmds.ls(sl=True)
+        if sel:
+            cmds.textField(self.root_node_field, edit=True, text=sel[0])
+
+    def populate_collect_grp(self, *args):
+        sel = cmds.ls(sl=True)
+        if sel:
+            cmds.textField(self.collect_grp_field, edit=True, text=sel[0])
+
+    def run_swap_old(self, *args):
+        hide_shape = cmds.checkBox(self.hide_old_shape_cb, query=True, value=True)
+        swap_and_suffix_old(hide_shape=hide_shape)
+
+    def run_remove_suffix(self, *args):
+        suffix = cmds.textField(self.remove_suffix_field, query=True, text=True).strip()
+        rename_remove_suffix_from_selection(suffix)
+
+    def run_collect_constraints(self, *args):
+        root_node = cmds.textField(self.root_node_field, query=True, text=True).strip()
+        target_grp = cmds.textField(self.collect_grp_field, query=True, text=True).strip() or "constraints_grp"
+        collect_constraints_under_hierarchy(root_node=root_node, target_grp=target_grp)
+
+    # --------------------------------------------------------------------------
+    # TAB 5: FK & Aim Utilities
+    # --------------------------------------------------------------------------
+    def build_fk_aim_tab(self, parent):
+        self.fk_aim_scroll = cmds.scrollLayout(childResizable=True, height=640)
+        self.fk_aim_container = cmds.columnLayout(adjustableColumn=True, rowSpacing=10)
+        
+        # ======================================================================
+        # SECTION 1: FK DriveChain
+        # ======================================================================
+        cmds.frameLayout(label="1. FK DriveChain System", collapsable=True, collapse=False, marginWidth=8, marginHeight=8, bgc=[0.18, 0.18, 0.18])
+        
+        cmds.rowLayout(numberOfColumns=2, columnWidth2=[185, 185], adjustableColumn=2)
+        cmds.button(label="Load All Cached Chains", command=self.load_all_fk_caches, bgc=[0.3, 0.45, 0.55])
+        cmds.button(label="+ Add New Chain Setup", command=lambda x: self.add_fk_chain_ui(), bgc=[0.4, 0.4, 0.4])
+        cmds.setParent('..')
+
+        cmds.separator(height=10, style='single')
+        self.fk_chains_container = cmds.columnLayout(adjustableColumn=True, rowSpacing=10)
+        cmds.setParent('..') # exit fk_chains_container
+        cmds.setParent('..') # exit frameLayout 1
+        
+        # ======================================================================
+        # SECTION 2: AimCurve Constraint System
+        # ======================================================================
+        cmds.frameLayout(label="2. AimCurve Constraint System", collapsable=True, collapse=False, marginWidth=8, marginHeight=8, bgc=[0.18, 0.22, 0.2])
+        
+        cmds.rowLayout(numberOfColumns=2, columnWidth2=[185, 185], adjustableColumn=2)
+        cmds.button(label="Load All Aim Caches", command=self.load_all_aim_caches, bgc=[0.3, 0.45, 0.55])
+        cmds.button(label="+ Add New Aim Setup", command=lambda x: self.add_aim_setup_ui(), bgc=[0.4, 0.4, 0.4])
+        cmds.setParent('..')
+
+        cmds.separator(height=10, style='single')
+        self.aim_setups_container = cmds.columnLayout(adjustableColumn=True, rowSpacing=10)
+        cmds.setParent('..') # exit aim_setups_container
+        cmds.setParent('..') # exit frameLayout 2
+
+        # ======================================================================
+        # SECTION 3: AimAndReduce By Distance
+        # ======================================================================
+        cmds.frameLayout(
+            label="3. AimAndReduce By Distance",
+            collapsable=True,
+            collapse=False,
+            marginWidth=8,
+            marginHeight=8,
+            bgc=[0.22, 0.20, 0.18]
+        )
+
+        cmds.rowLayout(numberOfColumns=2, columnWidth2=[185, 185], adjustableColumn=2)
+        cmds.button(
+            label="Load All Distance Aim Caches",
+            command=self.load_all_aim_distance_caches,
+            bgc=[0.3, 0.45, 0.55]
+        )
+        cmds.button(
+            label="+ Add Distance Aim Setup",
+            command=lambda x: self.add_aim_distance_setup_ui(),
+            bgc=[0.4, 0.4, 0.4]
+        )
+        cmds.setParent('..')
+
+        cmds.separator(height=10, style='single')
+        self.aim_distance_setups_container = cmds.columnLayout(
+            adjustableColumn=True,
+            rowSpacing=10
+        )
+        cmds.setParent('..') # exit aim_distance_setups_container
+        cmds.setParent('..') # exit frameLayout 3
+        
+        cmds.setParent('..') # exit fk_aim_container
+        cmds.setParent('..') # exit scroll
+
+    # --- AimCurve Caching & UI Methods ---
+    def add_aim_setup_ui(self, setup_name="SpineAim", root_grp="AtRoot", aim_axis="X", up_axis="Y", use_parent=True, pairs=None):
+        if pairs is None:
+            pairs = []
+            
+        cmds.setParent(self.aim_setups_container)
+        
+        frame = cmds.frameLayout(
+            label=f"Aim Setup: {setup_name}", 
+            collapsable=True, 
+            collapse=False, 
+            marginWidth=5, 
+            marginHeight=5, 
+            bgc=[0.2, 0.24, 0.22]
+        )
+        
+        aim_data = {
+            'frame': frame,
+            'pairs_data': []
+        }
+        
+        cmds.rowLayout(numberOfColumns=2, columnWidth2=[90, 260], adjustableColumn=2)
+        cmds.text(label="Setup Name:")
+        aim_data['name_field'] = cmds.textField(text=setup_name)
+        cmds.textField(
+            aim_data['name_field'], 
+            edit=True, 
+            changeCommand=lambda val, f=frame: cmds.frameLayout(f, edit=True, label=f"Aim Setup: {val}")
+        )
+        cmds.setParent('..')
+
+        cmds.rowLayout(numberOfColumns=2, columnWidth2=[90, 240], adjustableColumn=2)
+        cmds.text(label="AtRoot Group:")
+        aim_data['root_field'] = cmds.textField(text=root_grp, placeholderText="Parent group for everything...")
+        cmds.setParent('..')
+        
+        cmds.separator(height=6, style='single')
+        
+        cmds.rowLayout(numberOfColumns=4, columnWidth4=[60, 80, 60, 80])
+        cmds.text(label="Aim Axis:")
+        aim_data['aim_axis_menu'] = cmds.optionMenu()
+        for axis in ["X", "Y", "Z", "-X", "-Y", "-Z"]: cmds.menuItem(label=axis)
+        cmds.optionMenu(aim_data['aim_axis_menu'], edit=True, value=aim_axis)
+        
+        cmds.text(label="Up Axis:")
+        aim_data['up_axis_menu'] = cmds.optionMenu()
+        for axis in ["X", "Y", "Z", "-X", "-Y", "-Z"]: cmds.menuItem(label=axis)
+        cmds.optionMenu(aim_data['up_axis_menu'], edit=True, value=up_axis)
+        cmds.setParent('..')
+        
+        cmds.rowLayout(numberOfColumns=2, columnWidth2=[260, 100], adjustableColumn=1)
+        aim_data['use_parent_cb'] = cmds.checkBox(label="Use Controller Parent Rotation for Up Vector", value=use_parent)
+        cmds.button(label="Delete Aim UI", bgc=[0.6, 0.2, 0.2], command=lambda x, a=aim_data: self.remove_aim_ui(a))
+        cmds.setParent('..')
+        
+        cmds.separator(height=6, style='single')
+        
+        cmds.text(label="Aim Targets (Curve ? Controllers):", font="obliqueLabelFont", align="left")
+        aim_data['pairs_layout'] = cmds.columnLayout(adjustableColumn=True, rowSpacing=6)
+        cmds.setParent('..')
+        
+        cmds.button(
+            label="+ Add Aim Target (1st Sel = Curve, Rest = Ctrls)",
+            height=26,
+            command=lambda x, a=aim_data: self.add_aim_pair_from_sel(a)
+        )
+        
+        cmds.separator(height=10, style='none')
+        cmds.button(label="Generate Aim Constraints for Setup", height=34, bgc=[0.55, 0.45, 0.25], command=lambda x, a=aim_data: self.run_aim_curve(a))
+        
+        cmds.setParent('..') # exit frame
+        self.aim_setups_data.append(aim_data)
+        
+        for p in pairs:
+            self.add_aim_pair_from_sel(aim_data, crv_str=p.get('crv', ''), ctrls_str=p.get('ctrls', ''))
+            
+        return aim_data
+
+    def remove_aim_ui(self, aim_data):
+        if cmds.layout(aim_data['frame'], exists=True):
+            cmds.deleteUI(aim_data['frame'])
+        if aim_data in self.aim_setups_data:
+            self.aim_setups_data.remove(aim_data)
+            
+    def add_aim_pair_from_sel(self, aim_data, crv_str="", ctrls_str=""):
+        if not crv_str and not ctrls_str:
+            sel = cmds.ls(sl=True)
+            if sel:
+                crv_str = sel[0]
+                ctrls_str = ",".join(sel[1:])
+                
+        cmds.setParent(aim_data['pairs_layout'])
+        
+        pair_col = cmds.columnLayout(adjustableColumn=True)
+        
+        pair_dict = {'layout': pair_col}
+        
+        # Curve Row
+        cmds.rowLayout(numberOfColumns=3, columnWidth3=[40, 200, 50], adjustableColumn=2)
+        cmds.text(label="Crv:")
+        pair_dict['crv_tf'] = cmds.textField(text=crv_str)
+        cmds.button(label="Get Sel", command=lambda x, tf=pair_dict['crv_tf']: self._populate_field(tf))
+        cmds.setParent('..')
+        
+        # Ctrls Row
+        cmds.rowLayout(numberOfColumns=4, columnWidth4=[40, 160, 50, 40], adjustableColumn=2)
+        cmds.text(label="Ctrls:")
+        pair_dict['ctrls_tf'] = cmds.textField(text=ctrls_str)
+        
+        def _get_rest_sel(tf):
+            s = cmds.ls(sl=True)
+            if s: cmds.textField(tf, edit=True, text=",".join(s))
+            
+        cmds.button(label="Get Sel", command=lambda x, tf=pair_dict['ctrls_tf']: _get_rest_sel(tf))
+        
+        def _del_pair(p_dict):
+            cmds.deleteUI(p_dict['layout'])
+            if p_dict in aim_data['pairs_data']:
+                aim_data['pairs_data'].remove(p_dict)
+                
+        cmds.button(label="Del", bgc=[0.5, 0.2, 0.2], command=lambda x, pd=pair_dict: _del_pair(pd))
+        cmds.setParent('..')
+        
+        cmds.separator(style='singleDash')
+        cmds.setParent('..') # exit pair_col
+        
+        aim_data['pairs_data'].append(pair_dict)
+
+    def load_all_aim_caches(self, *args):
+        available_caches = cmds.ls("*AimCached") or []
+        if not available_caches:
+            cmds.warning("No cache nodes with suffix 'AimCached' found in the scene.")
+            return
+
+        for a_data in list(self.aim_setups_data):
+            self.remove_aim_ui(a_data)
+
+        for cache_node in available_caches:
+            try:
+                setup_name = cache_node.replace("AimCached", "")
+                root_grp = cmds.getAttr(f"{cache_node}.rootGrp") or "AtRoot"
+                aim_axis = cmds.getAttr(f"{cache_node}.aimAxis") or "X"
+                up_axis = cmds.getAttr(f"{cache_node}.upAxis") or "Y"
+                
+                use_parent = True
+                if cmds.attributeQuery("useParent", node=cache_node, exists=True):
+                    use_parent = cmds.getAttr(f"{cache_node}.useParent")
+                    
+                pair_count = 0
+                if cmds.attributeQuery("pairCount", node=cache_node, exists=True):
+                    pair_count = cmds.getAttr(f"{cache_node}.pairCount")
+                    
+                loaded_pairs = []
+                for i in range(pair_count):
+                    c_crv = ""
+                    c_ctrls = ""
+                    if cmds.attributeQuery(f"crv_{i}", node=cache_node, exists=True):
+                        c_crv = cmds.getAttr(f"{cache_node}.crv_{i}") or ""
+                    if cmds.attributeQuery(f"ctrls_{i}", node=cache_node, exists=True):
+                        c_ctrls = cmds.getAttr(f"{cache_node}.ctrls_{i}") or ""
+                        
+                    loaded_pairs.append({'crv': c_crv, 'ctrls': c_ctrls})
+
+                self.add_aim_setup_ui(setup_name, root_grp, aim_axis, up_axis, use_parent, pairs=loaded_pairs)
+            except Exception as e:
+                cmds.warning(f"Error loading cache node '{cache_node}': {e}")
+                
+        print(f"Loaded {len(available_caches)} Cached Aim Setup(s).")
+
+    # --- AimCurve Execution Logic ---
+    def run_aim_curve(self, aim_data):
+        setup_name = cmds.textField(aim_data['name_field'], query=True, text=True).strip()
+        if not setup_name:
+            cmds.warning("Please provide a Setup Name.")
+            return
+            
+        root_grp = cmds.textField(aim_data['root_field'], query=True, text=True).strip()
+        use_parent = cmds.checkBox(aim_data['use_parent_cb'], query=True, value=True)
+        
+        aim_axis_str = cmds.optionMenu(aim_data['aim_axis_menu'], query=True, value=True)
+        up_axis_str = cmds.optionMenu(aim_data['up_axis_menu'], query=True, value=True)
+        
+        axis_map = {"X": (1,0,0), "Y": (0,1,0), "Z": (0,0,1), "-X": (-1,0,0), "-Y": (0,-1,0), "-Z": (0,0,-1)}
+        aim_vec = axis_map.get(aim_axis_str, (1,0,0))
+        up_vec = axis_map.get(up_axis_str, (0,1,0))
+        
+        valid_pairs = []
+        for p in aim_data['pairs_data']:
+            if cmds.layout(p['layout'], exists=True):
+                crv = cmds.textField(p['crv_tf'], query=True, text=True).strip()
+                ctrls = cmds.textField(p['ctrls_tf'], query=True, text=True).strip()
+                if crv and ctrls:
+                    valid_pairs.append({'crv': crv, 'ctrls': ctrls})
+                    
+        if not valid_pairs:
+            cmds.warning(f"No valid targets provided for setup '{setup_name}'.")
+            return
+            
+        _begin_tool_undo("GenerateAimCurve")
+        try:
+            # 1. Update/Create Cache Node
+            cache_node = f"{setup_name}AimCached"
+            if not cmds.objExists(cache_node):
+                cache_node = cmds.group(empty=True, name=cache_node)
+                cmds.setAttr(f"{cache_node}.visibility", 0)
+
+            attrs = {
+                "rootGrp": "string",
+                "aimAxis": "string",
+                "upAxis": "string",
+                "useParent": "bool",
+                "pairCount": "long"
+            }
+            
+            for attr, atype in attrs.items():
+                if not cmds.attributeQuery(attr, node=cache_node, exists=True):
+                    if atype == "string":
+                        cmds.addAttr(cache_node, ln=attr, dt="string")
+                    elif atype == "bool":
+                        cmds.addAttr(cache_node, ln=attr, at="bool")
+                    elif atype == "long":
+                        cmds.addAttr(cache_node, ln=attr, at="long")
+
+            cmds.setAttr(f"{cache_node}.rootGrp", root_grp, type="string")
+            cmds.setAttr(f"{cache_node}.aimAxis", aim_axis_str, type="string")
+            cmds.setAttr(f"{cache_node}.upAxis", up_axis_str, type="string")
+            cmds.setAttr(f"{cache_node}.useParent", use_parent)
+            cmds.setAttr(f"{cache_node}.pairCount", len(valid_pairs))
+            
+            for i, p in enumerate(valid_pairs):
+                if not cmds.attributeQuery(f"crv_{i}", node=cache_node, exists=True):
+                    cmds.addAttr(cache_node, ln=f"crv_{i}", dt="string")
+                if not cmds.attributeQuery(f"ctrls_{i}", node=cache_node, exists=True):
+                    cmds.addAttr(cache_node, ln=f"ctrls_{i}", dt="string")
+                    
+                cmds.setAttr(f"{cache_node}.crv_{i}", p['crv'], type="string")
+                cmds.setAttr(f"{cache_node}.ctrls_{i}", p['ctrls'], type="string")
+
+            # 2. Build Constraint Logic
+            if not root_grp: 
+                root_grp = "AtRoot"
+            if not cmds.objExists(root_grp):
+                root_grp = cmds.group(empty=True, name=root_grp)
+                
+            total_ctrls_processed = 0
+            
+            for p in valid_pairs:
+                crv = p['crv']
+                ctrls_str = p['ctrls']
+                
+                if not cmds.objExists(crv):
+                    cmds.warning(f"DriverCurve '{crv}' does not exist. Skipping pair.")
+                    continue
+                    
+                shapes = cmds.listRelatives(crv, shapes=True, fullPath=True) or []
+                if cmds.nodeType(crv) == "nurbsCurve":
+                    shapes = [crv]
+                    
+                if not shapes or cmds.nodeType(shapes[0]) != "nurbsCurve":
+                    cmds.warning(f"Object '{crv}' is not a valid Nurbs Curve node. Skipping.")
+                    continue
+                    
+                crv_shape = shapes[0]
+                
+                sel_list = om.MSelectionList()
+                sel_list.add(crv_shape)
+                crv_dag = sel_list.getDagPath(0)
+                curve_fn = om.MFnNurbsCurve(crv_dag)
+                
+                ctrls = [x.strip() for x in ctrls_str.split(',') if cmds.objExists(x.strip())]
+                
+                for ctrl in ctrls:
+                    short_name = ctrl.split('|')[-1]
+                    
+                    # Create Aim Connection Group
+                    aim_grp_name = f"{short_name}_Aim"
+                    if cmds.objExists(aim_grp_name):
+                        cmds.warning(f"Aim group '{aim_grp_name}' already exists. Skipping recreation for '{ctrl}'.")
+                        continue
+                        
+                    aim_grp = cmds.group(empty=True, name=aim_grp_name)
+                    cmds.matchTransform(aim_grp, ctrl, position=True, rotation=True)
+                    
+                    ctrl_parent = cmds.listRelatives(ctrl, parent=True, fullPath=True)
+                    if ctrl_parent:
+                        cmds.parent(aim_grp, ctrl_parent[0])
+                        
+                    cmds.parent(ctrl, aim_grp)
+                    
+                    # Build tracking hierarchy mapped to curve
+                    offset = cmds.group(empty=True, name=f"Offset_{short_name}_AtRoot")
+                    at_root = cmds.group(empty=True, name=f"{short_name}_AtRoot")
+                    
+                    cmds.matchTransform(offset, aim_grp, position=True, rotation=True)
+                    cmds.matchTransform(at_root, aim_grp, position=True, rotation=True)
+                    
+                    cmds.parent(at_root, offset)
+                    cmds.parent(offset, root_grp)
+                    
+                    ctrl_pos = cmds.xform(aim_grp, query=True, worldSpace=True, rotatePivot=True)
+                    mpt = om.MPoint(ctrl_pos[0], ctrl_pos[1], ctrl_pos[2])
+                    
+                    closest_pt, u_param = curve_fn.closestPoint(mpt, space=om.MSpace.kWorld)
+                    
+                    loc = cmds.spaceLocator(name=f"{short_name}_target")[0]
+                    cmds.parent(loc, root_grp)
+                    
+                    poci = cmds.createNode('pointOnCurveInfo', name=f"{short_name}_poci")
+                    cmds.connectAttr(f"{crv_shape}.worldSpace[0]", f"{poci}.inputCurve", force=True)
+                    cmds.setAttr(f"{poci}.parameter", u_param)
+                    cmds.connectAttr(f"{poci}.position", f"{loc}.translate", force=True)
+                    
+                    # Use the ACTUAL parent of the driven Aim group as the
+                    # object-rotation up object. Query it after hierarchy setup so
+                    # we do not rely on a stale parent path captured earlier.
+                    driven_parent = cmds.listRelatives(
+                        aim_grp,
+                        parent=True,
+                        fullPath=True
+                    ) or []
+
+                    if use_parent and driven_parent:
+                        cmds.aimConstraint(
+                            loc,
+                            at_root,
+                            aimVector=aim_vec,
+                            upVector=up_vec,
+                            worldUpType="objectrotation",
+                            worldUpObject=driven_parent[0],
+                            maintainOffset=True
+                        )
+                    else:
+                        cmds.aimConstraint(
+                            loc,
+                            at_root,
+                            aimVector=aim_vec,
+                            upVector=up_vec,
+                            worldUpType="vector",
+                            worldUpVector=up_vec,
+                            maintainOffset=True
+                        )
+                        
+                    # Connect AtRoot to the new Aim group
+                    try:
+                        cmds.connectAttr(f"{at_root}.rotate", f"{aim_grp}.rotate", force=True)
+                        total_ctrls_processed += 1
+                    except Exception as e:
+                        cmds.warning(f"Could not connect {at_root}.rotate to {aim_grp}.rotate: {e}")
+                        
+            if total_ctrls_processed > 0:
+                print(f"Successfully Aimed {total_ctrls_processed} controllers mapped to cache '{cache_node}'.")
+            
+        finally:
+            _end_tool_undo()
+
+
+    # --------------------------------------------------------------------------
+    # SECTION 3: AimAndReduce By Distance
+    # --------------------------------------------------------------------------
+    def add_aim_distance_setup_ui(
+        self,
+        setup_name="SpineAimReduce",
+        root_grp="AtRoot",
+        slider_obj="",
+        falloff_distance=10.0,
+        aim_axis="X",
+        up_axis="Y",
+        use_parent=True,
+        pairs=None
+    ):
+        """Create one AimAndReduce By Distance setup UI."""
+        if pairs is None:
+            pairs = []
+
+        cmds.setParent(self.aim_distance_setups_container)
+
+        frame = cmds.frameLayout(
+            label=f"Distance Aim Setup: {setup_name}",
+            collapsable=True,
+            collapse=False,
+            marginWidth=5,
+            marginHeight=5,
+            bgc=[0.24, 0.22, 0.20]
+        )
+
+        aim_data = {
+            'frame': frame,
+            'pairs_data': []
+        }
+
+        # Setup Name
+        cmds.rowLayout(numberOfColumns=2, columnWidth2=[90, 260], adjustableColumn=2)
+        cmds.text(label="Setup Name:")
+        aim_data['name_field'] = cmds.textField(text=setup_name)
+        cmds.textField(
+            aim_data['name_field'],
+            edit=True,
+            changeCommand=lambda val, f=frame: cmds.frameLayout(
+                f, edit=True, label=f"Distance Aim Setup: {val}"
+            )
+        )
+        cmds.setParent('..')
+
+        # AtRoot Group
+        cmds.rowLayout(numberOfColumns=2, columnWidth2=[90, 240], adjustableColumn=2)
+        cmds.text(label="AtRoot Group:")
+        aim_data['root_field'] = cmds.textField(
+            text=root_grp,
+            placeholderText="Parent group for everything..."
+        )
+        cmds.setParent('..')
+
+        # Slider Object
+        cmds.rowLayout(numberOfColumns=3, columnWidth3=[90, 180, 60], adjustableColumn=2)
+        cmds.text(label="Slider:")
+        aim_data['slider_field'] = cmds.textField(
+            text=slider_obj,
+            placeholderText="Distance driver object..."
+        )
+        cmds.button(
+            label="Get Sel",
+            command=lambda x, f=aim_data['slider_field']: self._populate_transform_field(f)
+        )
+        cmds.setParent('..')
+
+        # Initial DistanceMax value.  On Generate this becomes a keyable
+        # attribute on the Slider transform.  Existing slider values are preserved.
+        cmds.rowLayout(numberOfColumns=2, columnWidth2=[90, 240], adjustableColumn=2)
+        cmds.text(label="Distance Max:")
+        aim_data['falloff_field'] = cmds.floatField(
+            value=falloff_distance,
+            minValue=0.001,
+            precision=3
+        )
+        cmds.setParent('..')
+
+        cmds.text(
+            label="Slider attrs: DistanceMax = falloff radius | Power = aim strength",
+            align="left"
+        )
+        cmds.separator(height=6, style='single')
+
+        # Aim / Up Axis
+        cmds.rowLayout(numberOfColumns=4, columnWidth4=[60, 80, 60, 80])
+        cmds.text(label="Aim Axis:")
+        aim_data['aim_axis_menu'] = cmds.optionMenu()
+        for axis in ["X", "Y", "Z", "-X", "-Y", "-Z"]:
+            cmds.menuItem(label=axis)
+        cmds.optionMenu(aim_data['aim_axis_menu'], edit=True, value=aim_axis)
+
+        cmds.text(label="Up Axis:")
+        aim_data['up_axis_menu'] = cmds.optionMenu()
+        for axis in ["X", "Y", "Z", "-X", "-Y", "-Z"]:
+            cmds.menuItem(label=axis)
+        cmds.optionMenu(aim_data['up_axis_menu'], edit=True, value=up_axis)
+        cmds.setParent('..')
+
+        cmds.rowLayout(numberOfColumns=2, columnWidth2=[260, 100], adjustableColumn=1)
+        aim_data['use_parent_cb'] = cmds.checkBox(
+            label="Use Controller Parent Rotation for Up Vector",
+            value=use_parent
+        )
+        cmds.button(
+            label="Delete Aim UI",
+            bgc=[0.6, 0.2, 0.2],
+            command=lambda x, a=aim_data: self.remove_aim_distance_ui(a)
+        )
+        cmds.setParent('..')
+
+        cmds.separator(height=6, style='single')
+
+        cmds.text(
+            label="Aim Targets (Curve ? Controllers):",
+            font="obliqueLabelFont",
+            align="left"
+        )
+        aim_data['pairs_layout'] = cmds.columnLayout(adjustableColumn=True, rowSpacing=6)
+        cmds.setParent('..')
+
+        # Reuse Section 2's curve/controller pair widget.
+        cmds.button(
+            label="+ Add Aim Target (Curve + Ctrls; Slider ignored)",
+            height=26,
+            command=lambda x, a=aim_data: self.add_aim_distance_pair_from_sel(a)
+        )
+
+        cmds.separator(height=10, style='none')
+        cmds.button(
+            label="Generate All Pending Distance Aim Tasks",
+            height=34,
+            bgc=[0.55, 0.40, 0.22],
+            command=lambda x, a=aim_data: self.run_aim_distance(a)
+        )
+
+        cmds.setParent('..') # exit frame
+        self.aim_distance_setups_data.append(aim_data)
+
+        # Cached tasks must use the Section 3 task UI too, otherwise they would
+        # lose the per-task Generate button when loaded from cache.
+        for p in pairs:
+            self.add_aim_distance_pair_ui(
+                aim_data,
+                crv_str=p.get('crv', ''),
+                ctrls_str=p.get('ctrls', '')
+            )
+
+        return aim_data
+
+    def remove_aim_distance_ui(self, aim_data):
+        if cmds.layout(aim_data['frame'], exists=True):
+            cmds.deleteUI(aim_data['frame'])
+        if aim_data in self.aim_distance_setups_data:
+            self.aim_distance_setups_data.remove(aim_data)
+
+    def _populate_transform_field(self, field_widget):
+        """Populate a textField with the first selected transform node."""
+        sel = cmds.ls(sl=True, type="transform") or []
+        if not sel:
+            cmds.warning("Please select a transform object for Slider.")
+            return
+        cmds.textField(field_widget, edit=True, text=sel[0])
+
+    def _populate_aim_distance_curve_field(self, field_widget, aim_data):
+        """Populate Section 3 Curve field only with a valid NURBS curve."""
+        sel = cmds.ls(sl=True) or []
+        if not sel:
+            cmds.warning("Please select a NURBS curve for Crv.")
+            return
+
+        slider_obj = cmds.textField(
+            aim_data['slider_field'], query=True, text=True
+        ).strip()
+
+        for node in sel:
+            if node == slider_obj:
+                continue
+
+            if not cmds.objExists(node):
+                continue
+
+            if cmds.nodeType(node) == "nurbsCurve":
+                parents = cmds.listRelatives(node, parent=True, fullPath=False) or []
+                cmds.textField(
+                    field_widget, edit=True, text=parents[0] if parents else node
+                )
+                return
+
+            if cmds.nodeType(node) == "transform":
+                shapes = cmds.listRelatives(
+                    node, shapes=True, noIntermediate=True, type="nurbsCurve"
+                ) or []
+                if shapes:
+                    cmds.textField(field_widget, edit=True, text=node)
+                    return
+
+        cmds.warning("Select a NURBS curve transform for Crv; Slider is a separate transform field.")
+
+    def add_aim_distance_pair_ui(self, aim_data, crv_str="", ctrls_str=""):
+        """
+        Add one independently runnable Distance Aim task.
+
+        Each task owns its own Generate button, so adding a new task does not
+        require rebuilding/walking tasks that were already completed.
+        """
+        cmds.setParent(aim_data['pairs_layout'])
+
+        task_frame = cmds.frameLayout(
+            label="Distance Aim Task",
+            collapsable=True,
+            collapse=False,
+            marginWidth=5,
+            marginHeight=5,
+            bgc=[0.20, 0.20, 0.20]
+        )
+
+        pair_dict = {
+            'layout': task_frame
+        }
+
+        # Curve row
+        cmds.rowLayout(
+            numberOfColumns=3,
+            columnWidth3=[40, 200, 50],
+            adjustableColumn=2
+        )
+        cmds.text(label="Crv:")
+        pair_dict['crv_tf'] = cmds.textField(text=crv_str)
+        cmds.button(
+            label="Get Sel",
+            command=lambda x, tf=pair_dict['crv_tf'], a=aim_data: self._populate_aim_distance_curve_field(tf, a)
+        )
+        cmds.setParent('..')
+
+        # Controllers row
+        cmds.rowLayout(
+            numberOfColumns=4,
+            columnWidth4=[40, 160, 50, 40],
+            adjustableColumn=2
+        )
+        cmds.text(label="Ctrls:")
+        pair_dict['ctrls_tf'] = cmds.textField(text=ctrls_str)
+
+        def _get_ctrl_selection(tf):
+            selected = cmds.ls(sl=True) or []
+            slider = cmds.textField(
+                aim_data['slider_field'], query=True, text=True
+            ).strip()
+            # Slider is a separate transform input, never a controller entry.
+            selected = [node for node in selected if node != slider]
+            if selected:
+                cmds.textField(tf, edit=True, text=",".join(selected))
+
+        cmds.button(
+            label="Get Sel",
+            command=lambda x, tf=pair_dict['ctrls_tf']: _get_ctrl_selection(tf)
+        )
+
+        def _delete_task(task):
+            if cmds.layout(task['layout'], exists=True):
+                cmds.deleteUI(task['layout'])
+            if task in aim_data['pairs_data']:
+                aim_data['pairs_data'].remove(task)
+
+        cmds.button(
+            label="Del",
+            bgc=[0.5, 0.2, 0.2],
+            command=lambda x, task=pair_dict: _delete_task(task)
+        )
+        cmds.setParent('..')
+
+        cmds.separator(height=5, style='none')
+
+        # This is the important change: run only this task.
+        pair_dict['generate_btn'] = cmds.button(
+            label="Generate AIM + Distance for This Task",
+            height=28,
+            bgc=[0.45, 0.38, 0.20],
+            command=lambda x, a=aim_data, task=pair_dict: self.run_aim_distance(
+                a, only_pair=task
+            )
+        )
+
+        cmds.setParent('..') # exit task frame
+        aim_data['pairs_data'].append(pair_dict)
+        return pair_dict
+
+    def add_aim_distance_pair_from_sel(self, aim_data):
+        """Add a Section 3 task from selection, excluding the Slider transform."""
+        sel = cmds.ls(sl=True) or []
+        slider_obj = cmds.textField(
+            aim_data['slider_field'], query=True, text=True
+        ).strip()
+
+        # Slider is a separate transform input and must never become the curve.
+        filtered = [node for node in sel if node != slider_obj]
+
+        if not filtered:
+            return self.add_aim_distance_pair_ui(
+                aim_data, crv_str="", ctrls_str=""
+            )
+
+        crv_str = filtered[0]
+        ctrls_str = ",".join(filtered[1:])
+        return self.add_aim_distance_pair_ui(
+            aim_data,
+            crv_str=crv_str,
+            ctrls_str=ctrls_str
+        )
+
+    def load_all_aim_distance_caches(self, *args):
+        available_caches = cmds.ls("*AimDistanceCached", type="transform") or []
+        if not available_caches:
+            cmds.warning("No cache nodes with suffix 'AimDistanceCached' found in the scene.")
+            return
+
+        for data in list(self.aim_distance_setups_data):
+            self.remove_aim_distance_ui(data)
+
+        for cache_node in available_caches:
+            try:
+                setup_name = cache_node.replace("AimDistanceCached", "")
+                root_grp = "AtRoot"
+                slider_obj = ""
+                falloff_distance = 10.0
+                aim_axis = "X"
+                up_axis = "Y"
+                use_parent = True
+                pair_count = 0
+
+                if cmds.attributeQuery("rootGrp", node=cache_node, exists=True):
+                    root_grp = cmds.getAttr(f"{cache_node}.rootGrp") or "AtRoot"
+                if cmds.attributeQuery("sliderObj", node=cache_node, exists=True):
+                    slider_obj = cmds.getAttr(f"{cache_node}.sliderObj") or ""
+                if cmds.attributeQuery("falloffDistance", node=cache_node, exists=True):
+                    falloff_distance = cmds.getAttr(f"{cache_node}.falloffDistance")
+                if cmds.attributeQuery("aimAxis", node=cache_node, exists=True):
+                    aim_axis = cmds.getAttr(f"{cache_node}.aimAxis") or "X"
+                if cmds.attributeQuery("upAxis", node=cache_node, exists=True):
+                    up_axis = cmds.getAttr(f"{cache_node}.upAxis") or "Y"
+                if cmds.attributeQuery("useParent", node=cache_node, exists=True):
+                    use_parent = cmds.getAttr(f"{cache_node}.useParent")
+                if cmds.attributeQuery("pairCount", node=cache_node, exists=True):
+                    pair_count = cmds.getAttr(f"{cache_node}.pairCount")
+
+                loaded_pairs = []
+                for i in range(pair_count):
+                    crv = ""
+                    ctrls = ""
+                    if cmds.attributeQuery(f"crv_{i}", node=cache_node, exists=True):
+                        crv = cmds.getAttr(f"{cache_node}.crv_{i}") or ""
+                    if cmds.attributeQuery(f"ctrls_{i}", node=cache_node, exists=True):
+                        ctrls = cmds.getAttr(f"{cache_node}.ctrls_{i}") or ""
+                    loaded_pairs.append({'crv': crv, 'ctrls': ctrls})
+
+                self.add_aim_distance_setup_ui(
+                    setup_name=setup_name,
+                    root_grp=root_grp,
+                    slider_obj=slider_obj,
+                    falloff_distance=falloff_distance,
+                    aim_axis=aim_axis,
+                    up_axis=up_axis,
+                    use_parent=use_parent,
+                    pairs=loaded_pairs
+                )
+
+            except Exception as e:
+                cmds.warning(f"Error loading Distance Aim cache '{cache_node}': {e}")
+
+        print(f"Loaded {len(available_caches)} Distance Aim Setup(s).")
+
+    def _ensure_aim_distance_slider_attrs(self, slider_obj, distance_default=10.0):
+        """
+        Add animator-facing attributes to the Section 3 Slider transform.
+
+        DistanceMax:
+            World-space falloff radius.  Distance >= DistanceMax gives zero weight.
+
+        Power:
+            Final aim strength multiplier.  0 = off, 1 = normal, 2 = double.
+
+        Existing attributes/animation are preserved.
+        """
+        if not cmds.objExists(slider_obj) or cmds.nodeType(slider_obj) != "transform":
+            raise RuntimeError(
+                "Aim distance slider '{}' must be a transform.".format(slider_obj)
+            )
+
+        distance_attr = f"{slider_obj}.DistanceMax"
+        power_attr = f"{slider_obj}.Power"
+
+        if not cmds.attributeQuery("DistanceMax", node=slider_obj, exists=True):
+            cmds.addAttr(
+                slider_obj,
+                longName="DistanceMax",
+                niceName="Distance Max",
+                attributeType="double",
+                minValue=0.001,
+                defaultValue=max(float(distance_default), 0.001),
+                keyable=True
+            )
+
+        if not cmds.attributeQuery("Power", node=slider_obj, exists=True):
+            cmds.addAttr(
+                slider_obj,
+                longName="Power",
+                niceName="Power",
+                attributeType="double",
+                minValue=0.0,
+                defaultValue=1.0,
+                keyable=True
+            )
+
+        # Be defensive if a slider already had attributes with these names.
+        numeric_types = {
+            "double", "float", "doubleLinear", "doubleAngle",
+            "long", "short", "byte"
+        }
+        for plug in (distance_attr, power_attr):
+            attr_type = cmds.getAttr(plug, type=True)
+            if attr_type not in numeric_types:
+                raise RuntimeError(
+                    "Slider attribute '{}' already exists but is type '{}'. "
+                    "Please rename/remove that attribute before generating.".format(
+                        plug, attr_type
+                    )
+                )
+
+        return distance_attr, power_attr
+
+
+    def run_aim_distance(self, aim_data, only_pair=None):
+        """
+        Build the same AimCurve system as Section 2, but drive each Aim group with:
+
+        If only_pair is supplied, only that Distance Aim task is processed.
+        This lets each task have its own Generate button without revisiting earlier tasks.
+
+            AtRoot.rotate * distanceWeight
+
+        distanceWeight is calculated from the Slider object to the controller's
+        corresponding AtRoot transform.  This keeps the distance reference out of
+        the animated controller hierarchy:
+
+            distance = 0                   -> base weight = 1
+            distance >= Slider.DistanceMax -> base weight = 0
+
+        Final weight = base weight * Slider.Power
+        """
+        setup_name = cmds.textField(
+            aim_data['name_field'], query=True, text=True
+        ).strip()
+        if not setup_name:
+            cmds.warning("Please provide a Setup Name.")
+            return
+
+        root_grp = cmds.textField(
+            aim_data['root_field'], query=True, text=True
+        ).strip()
+        slider_obj = cmds.textField(
+            aim_data['slider_field'], query=True, text=True
+        ).strip()
+
+        if not slider_obj or not cmds.objExists(slider_obj):
+            cmds.warning("Please provide a valid Slider transform object.")
+            return
+
+        if cmds.nodeType(slider_obj) != "transform":
+            cmds.warning(
+                "Slider '{}' must be a transform node, not '{}'.".format(
+                    slider_obj, cmds.nodeType(slider_obj)
+                )
+            )
+            return
+
+        falloff_distance = cmds.floatField(
+            aim_data['falloff_field'], query=True, value=True
+        )
+        if falloff_distance <= 0:
+            cmds.warning("Distance Max must be greater than 0.")
+            return
+
+        use_parent = cmds.checkBox(
+            aim_data['use_parent_cb'], query=True, value=True
+        )
+        aim_axis_str = cmds.optionMenu(
+            aim_data['aim_axis_menu'], query=True, value=True
+        )
+        up_axis_str = cmds.optionMenu(
+            aim_data['up_axis_menu'], query=True, value=True
+        )
+
+        axis_map = {
+            "X": (1, 0, 0),
+            "Y": (0, 1, 0),
+            "Z": (0, 0, 1),
+            "-X": (-1, 0, 0),
+            "-Y": (0, -1, 0),
+            "-Z": (0, 0, -1)
+        }
+        aim_vec = axis_map.get(aim_axis_str, (1, 0, 0))
+        up_vec = axis_map.get(up_axis_str, (0, 1, 0))
+
+        # Collect every valid task for cache persistence, but optionally execute
+        # only the task whose local Generate button was pressed.
+        valid_pairs = []
+        pair_lookup = {}
+
+        for p in aim_data['pairs_data']:
+            if not cmds.layout(p['layout'], exists=True):
+                continue
+
+            crv = cmds.textField(
+                p['crv_tf'], query=True, text=True
+            ).strip()
+            ctrls = cmds.textField(
+                p['ctrls_tf'], query=True, text=True
+            ).strip()
+
+            if crv and ctrls:
+                pair_values = {
+                    'crv': crv,
+                    'ctrls': ctrls,
+                    '_ui_pair': p
+                }
+                valid_pairs.append(pair_values)
+                pair_lookup[id(p)] = pair_values
+
+        if not valid_pairs:
+            cmds.warning(f"No valid targets provided for setup '{setup_name}'.")
+            return
+
+        if only_pair is not None:
+            selected_pair = pair_lookup.get(id(only_pair))
+            if not selected_pair:
+                cmds.warning("This Distance Aim task needs both a Curve and Controllers.")
+                return
+            process_pairs = [selected_pair]
+        else:
+            process_pairs = valid_pairs
+
+        # One click = one Maya Undo.
+        _begin_tool_undo("AimAndReduceByDistance")
+        try:
+            # Create/reuse animator-facing attributes directly on the Slider.
+            # Keeping this inside the chunk means the whole setup is one Undo.
+            try:
+                slider_distance_attr, slider_power_attr = (
+                    self._ensure_aim_distance_slider_attrs(
+                        slider_obj, distance_default=falloff_distance
+                    )
+                )
+            except RuntimeError as exc:
+                cmds.warning(str(exc))
+                return
+
+            # --------------------------------------------------------------
+            # Cache
+            # --------------------------------------------------------------
+            cache_node = f"{setup_name}AimDistanceCached"
+            if not cmds.objExists(cache_node):
+                cache_node = cmds.group(empty=True, name=cache_node)
+                cmds.setAttr(f"{cache_node}.visibility", 0)
+
+            attrs = {
+                "rootGrp": "string",
+                "sliderObj": "string",
+                "falloffDistance": "double",
+                "aimAxis": "string",
+                "upAxis": "string",
+                "useParent": "bool",
+                "pairCount": "long"
+            }
+
+            for attr, atype in attrs.items():
+                if cmds.attributeQuery(attr, node=cache_node, exists=True):
+                    continue
+                if atype == "string":
+                    cmds.addAttr(cache_node, ln=attr, dt="string")
+                elif atype == "double":
+                    cmds.addAttr(cache_node, ln=attr, at="double")
+                elif atype == "bool":
+                    cmds.addAttr(cache_node, ln=attr, at="bool")
+                elif atype == "long":
+                    cmds.addAttr(cache_node, ln=attr, at="long")
+
+            cmds.setAttr(f"{cache_node}.rootGrp", root_grp, type="string")
+            cmds.setAttr(f"{cache_node}.sliderObj", slider_obj, type="string")
+            # Keep legacy cache compatibility, but store the slider's current
+            # DistanceMax rather than a baked network value.
+            cmds.setAttr(
+                f"{cache_node}.falloffDistance",
+                cmds.getAttr(slider_distance_attr)
+            )
+            cmds.setAttr(f"{cache_node}.aimAxis", aim_axis_str, type="string")
+            cmds.setAttr(f"{cache_node}.upAxis", up_axis_str, type="string")
+            cmds.setAttr(f"{cache_node}.useParent", use_parent)
+            cmds.setAttr(f"{cache_node}.pairCount", len(valid_pairs))
+
+            for i, pair in enumerate(valid_pairs):
+                crv_attr = f"crv_{i}"
+                ctrls_attr = f"ctrls_{i}"
+
+                if not cmds.attributeQuery(crv_attr, node=cache_node, exists=True):
+                    cmds.addAttr(cache_node, ln=crv_attr, dt="string")
+                if not cmds.attributeQuery(ctrls_attr, node=cache_node, exists=True):
+                    cmds.addAttr(cache_node, ln=ctrls_attr, dt="string")
+
+                cmds.setAttr(f"{cache_node}.{crv_attr}", pair['crv'], type="string")
+                cmds.setAttr(f"{cache_node}.{ctrls_attr}", pair['ctrls'], type="string")
+
+            # --------------------------------------------------------------
+            # Root
+            # --------------------------------------------------------------
+            if not root_grp:
+                root_grp = "AtRoot"
+            if not cmds.objExists(root_grp):
+                root_grp = cmds.group(empty=True, name=root_grp)
+
+            total_ctrls_processed = 0
+            total_ctrls_already_done = 0
+
+            for pair in process_pairs:
+                crv = pair['crv']
+                ctrls_str = pair['ctrls']
+
+                if not cmds.objExists(crv):
+                    cmds.warning(f"DriverCurve '{crv}' does not exist. Skipping pair.")
+                    continue
+
+                shapes = cmds.listRelatives(
+                    crv, shapes=True, fullPath=True
+                ) or []
+                if cmds.nodeType(crv) == "nurbsCurve":
+                    shapes = [crv]
+
+                if not shapes or cmds.nodeType(shapes[0]) != "nurbsCurve":
+                    if crv == slider_obj:
+                        cmds.warning(
+                            "Slider '{}' is a transform and cannot be used as the Curve. "
+                            "Set Slider in the Slider field and a NURBS curve in Crv.".format(crv)
+                        )
+                    else:
+                        cmds.warning(
+                            "Object '{}' is not a valid Nurbs Curve node. Skipping.".format(crv)
+                        )
+                    continue
+
+                crv_shape = shapes[0]
+
+                sel_list = om.MSelectionList()
+                sel_list.add(crv_shape)
+                crv_dag = sel_list.getDagPath(0)
+                curve_fn = om.MFnNurbsCurve(crv_dag)
+
+                ctrls = [
+                    x.strip()
+                    for x in ctrls_str.split(',')
+                    if cmds.objExists(x.strip())
+                ]
+
+                for ctrl in ctrls:
+                    short_name = ctrl.split('|')[-1]
+
+                    # Capture the original controller parent for hierarchy insertion
+                    # and (optionally) the aimConstraint up-vector source.  It is NOT
+                    # used for distance, because it may move during animation.
+                    ctrl_parent_list = cmds.listRelatives(
+                        ctrl, parent=True, fullPath=True
+                    ) or []
+                    ctrl_parent = ctrl_parent_list[0] if ctrl_parent_list else None
+
+                    # ------------------------------------------------------
+                    # Driven group
+                    # ------------------------------------------------------
+                    aim_grp_name = f"{short_name}_AimDistance"
+                    if cmds.objExists(aim_grp_name):
+                        # Already generated. This is expected when using
+                        # "Generate All Pending" after some tasks were built
+                        # individually, so skip quietly and do not rebuild it.
+                        total_ctrls_already_done += 1
+                        continue
+
+                    aim_grp = cmds.group(empty=True, name=aim_grp_name)
+                    cmds.matchTransform(aim_grp, ctrl, position=True, rotation=True)
+
+                    if ctrl_parent:
+                        # Preserve world transform while placing the new group next
+                        # to the controller under its original parent.
+                        cmds.parent(aim_grp, ctrl_parent, absolute=True)
+
+                    # Preserve controller world transform when inserting group.
+                    cmds.parent(ctrl, aim_grp, absolute=True)
+
+                    # ------------------------------------------------------
+                    # Tracking hierarchy mapped to curve
+                    # ------------------------------------------------------
+                    offset = cmds.group(
+                        empty=True,
+                        name=f"Offset_{short_name}_AimDistance_AtRoot"
+                    )
+                    at_root = cmds.group(
+                        empty=True,
+                        name=f"{short_name}_AimDistance_AtRoot"
+                    )
+
+                    cmds.matchTransform(offset, aim_grp, position=True, rotation=True)
+                    cmds.matchTransform(at_root, aim_grp, position=True, rotation=True)
+                    cmds.parent(at_root, offset)
+                    cmds.parent(offset, root_grp)
+
+                    ctrl_pos = cmds.xform(
+                        aim_grp,
+                        query=True,
+                        worldSpace=True,
+                        rotatePivot=True
+                    )
+                    mpt = om.MPoint(ctrl_pos[0], ctrl_pos[1], ctrl_pos[2])
+                    _, u_param = curve_fn.closestPoint(mpt, space=om.MSpace.kWorld)
+
+                    # ------------------------------------------------------
+                    # Point on curve locator
+                    # ------------------------------------------------------
+                    loc = cmds.spaceLocator(
+                        name=f"{short_name}_AimDistance_target"
+                    )[0]
+                    cmds.parent(loc, root_grp)
+
+                    poci = cmds.createNode(
+                        'pointOnCurveInfo',
+                        name=f"{short_name}_AimDistance_poci"
+                    )
+                    cmds.connectAttr(
+                        f"{crv_shape}.worldSpace[0]",
+                        f"{poci}.inputCurve",
+                        force=True
+                    )
+                    cmds.setAttr(f"{poci}.parameter", u_param)
+                    cmds.connectAttr(
+                        f"{poci}.position",
+                        f"{loc}.translate",
+                        force=True
+                    )
+
+                    # ------------------------------------------------------
+                    # Aim calculation
+                    # ------------------------------------------------------
+                    # The object-rotation up object must be the ACTUAL parent of
+                    # the driven AimDistance group. Query it after parenting so
+                    # animation/hierarchy changes do not leave us using the wrong
+                    # transform or an old DAG path.
+                    driven_parent = cmds.listRelatives(
+                        aim_grp,
+                        parent=True,
+                        fullPath=True
+                    ) or []
+
+                    if use_parent and driven_parent:
+                        cmds.aimConstraint(
+                            loc,
+                            at_root,
+                            aimVector=aim_vec,
+                            upVector=up_vec,
+                            worldUpType="objectrotation",
+                            worldUpObject=driven_parent[0],
+                            maintainOffset=True
+                        )
+                    else:
+                        cmds.aimConstraint(
+                            loc,
+                            at_root,
+                            aimVector=aim_vec,
+                            upVector=up_vec,
+                            worldUpType="vector",
+                            worldUpVector=up_vec,
+                            maintainOffset=True
+                        )
+
+                    # ------------------------------------------------------
+                    # Distance: Slider <-> corresponding AtRoot transform
+                    #
+                    # Do NOT use ctrl_parent / aim_grp here.  Those live in the
+                    # animated controller hierarchy, so their positions may change
+                    # during animation and unintentionally change the falloff.
+                    #
+                    # The AtRoot transform is the stable reference created for this
+                    # controller in the AtRoot tracking hierarchy.
+                    # ------------------------------------------------------
+                    distance_node = cmds.createNode(
+                        "distanceBetween",
+                        name=f"{short_name}_AimDistance_DST"
+                    )
+                    cmds.connectAttr(
+                        f"{slider_obj}.worldMatrix[0]",
+                        f"{distance_node}.inMatrix1",
+                        force=True
+                    )
+                    cmds.connectAttr(
+                        f"{at_root}.worldMatrix[0]",
+                        f"{distance_node}.inMatrix2",
+                        force=True
+                    )
+
+                    # ------------------------------------------------------
+                    # Distance -> 0..1 weight
+                    # 0 distance       = 1.0
+                    # falloff distance = 0.0
+                    # farther          = clamped to 0.0
+                    # ------------------------------------------------------
+                    remap = cmds.createNode(
+                        "remapValue",
+                        name=f"{short_name}_AimDistance_Remap"
+                    )
+                    cmds.connectAttr(
+                        f"{distance_node}.distance",
+                        f"{remap}.inputValue",
+                        force=True
+                    )
+                    cmds.setAttr(f"{remap}.inputMin", 0.0)
+                    # Live animation control from the Slider transform.
+                    cmds.connectAttr(
+                        slider_distance_attr,
+                        f"{remap}.inputMax",
+                        force=True
+                    )
+                    cmds.setAttr(f"{remap}.outputMin", 1.0)
+                    cmds.setAttr(f"{remap}.outputMax", 0.0)
+
+                    # Linear distance falloff:
+                    # near = 1, DistanceMax = 0.
+                    cmds.setAttr(f"{remap}.value[0].value_Position", 0.0)
+                    cmds.setAttr(f"{remap}.value[0].value_FloatValue", 0.0)
+                    cmds.setAttr(f"{remap}.value[0].value_Interp", 1)
+                    cmds.setAttr(f"{remap}.value[1].value_Position", 1.0)
+                    cmds.setAttr(f"{remap}.value[1].value_FloatValue", 1.0)
+                    cmds.setAttr(f"{remap}.value[1].value_Interp", 1)
+
+                    # ------------------------------------------------------
+                    # Final weight = distance falloff * Slider.Power
+                    # ------------------------------------------------------
+                    power_mdl = cmds.createNode(
+                        "multDoubleLinear",
+                        name=f"{short_name}_AimDistance_Power_MDL"
+                    )
+                    cmds.connectAttr(
+                        f"{remap}.outValue",
+                        f"{power_mdl}.input1",
+                        force=True
+                    )
+                    cmds.connectAttr(
+                        slider_power_attr,
+                        f"{power_mdl}.input2",
+                        force=True
+                    )
+
+                    # ------------------------------------------------------
+                    # AtRoot.rotate * finalWeight -> driven group.rotate
+                    # ------------------------------------------------------
+                    rotate_md = cmds.createNode(
+                        "multiplyDivide",
+                        name=f"{short_name}_AimDistance_MD_R"
+                    )
+                    cmds.connectAttr(
+                        f"{at_root}.rotate",
+                        f"{rotate_md}.input1",
+                        force=True
+                    )
+                    cmds.connectAttr(
+                        f"{power_mdl}.output",
+                        f"{rotate_md}.input2X",
+                        force=True
+                    )
+                    cmds.connectAttr(
+                        f"{power_mdl}.output",
+                        f"{rotate_md}.input2Y",
+                        force=True
+                    )
+                    cmds.connectAttr(
+                        f"{power_mdl}.output",
+                        f"{rotate_md}.input2Z",
+                        force=True
+                    )
+                    cmds.connectAttr(
+                        f"{rotate_md}.output",
+                        f"{aim_grp}.rotate",
+                        force=True
+                    )
+
+                    total_ctrls_processed += 1
+
+            if only_pair is not None:
+                # Keep the button runnable so the artist can add more controllers
+                # to the same task later. Existing controllers are skipped.
+                if cmds.control(only_pair.get('generate_btn', ''), exists=True):
+                    if total_ctrls_processed > 0:
+                        cmds.button(
+                            only_pair['generate_btn'],
+                            edit=True,
+                            label="Generate Missing AIM + Distance (Task Built)"
+                        )
+                    elif total_ctrls_already_done > 0:
+                        cmds.button(
+                            only_pair['generate_btn'],
+                            edit=True,
+                            label="Generate Missing AIM + Distance (Already Built)"
+                        )
+
+            if total_ctrls_processed > 0:
+                print(
+                    f"Successfully created AimAndReduce By Distance for "
+                    f"{total_ctrls_processed} controller(s), mapped to "
+                    f"cache '{cache_node}'."
+                )
+            elif total_ctrls_already_done > 0:
+                print(
+                    f"Distance Aim task already built for "
+                    f"{total_ctrls_already_done} controller(s); nothing repeated."
+                )
+
+        finally:
+            _end_tool_undo()
+
+
+    # --- FK DriveChain Methods ---
+    def add_fk_chain_ui(self, parent_node="", chain_name="Arm", is_fk=True, groups=None, vis_on_shape=True):
+        if groups is None:
+            groups = []
+
+        cmds.setParent(self.fk_chains_container)
+        
+        frame = cmds.frameLayout(
+            label=f"Chain Setup: {chain_name}", 
+            collapsable=True, 
+            collapse=False, 
+            marginWidth=5, 
+            marginHeight=5, 
+            bgc=[0.22, 0.22, 0.22]
+        )
+        
+        chain_data = {
+            'frame': frame,
+            'group_fields': []
+        }
+        
+        cmds.rowLayout(numberOfColumns=3, columnWidth3=[70, 180, 60], adjustableColumn=2)
+        cmds.text(label="Parent:")
+        chain_data['parent_field'] = cmds.textField(text=parent_node, placeholderText="Attach root control under...")
+        cmds.button(label="Get Sel", command=lambda x, f=chain_data['parent_field']: self._populate_field(f))
+        cmds.setParent('..')
+
+        cmds.rowLayout(numberOfColumns=2, columnWidth2=[70, 240], adjustableColumn=2)
+        cmds.text(label="Name:")
+        chain_data['name_field'] = cmds.textField(text=chain_name)
+        cmds.textField(
+            chain_data['name_field'], 
+            edit=True, 
+            changeCommand=lambda val, f=frame: cmds.frameLayout(f, edit=True, label=f"Chain Setup: {val}")
+        )
+        cmds.setParent('..')
+        
+        cmds.rowLayout(numberOfColumns=2, columnWidth2=[200, 100], adjustableColumn=1)
+        chain_data['fk_cb'] = cmds.checkBox(label="FK Sequence (Parent consecutive)", value=is_fk)
+        cmds.button(label="Delete Chain UI", bgc=[0.6, 0.2, 0.2], command=lambda x, c=chain_data: self.remove_chain_ui(c))
+        cmds.setParent('..')
+        
+        cmds.rowLayout(numberOfColumns=1)
+        chain_data['vis_shape_cb'] = cmds.checkBox(label="Apply Visibility to Shapes (instead of Transform)", value=vis_on_shape)
+        cmds.setParent('..')
+
+        cmds.separator(height=6, style='single')
+
+        cmds.text(label="Driven Item Groups:", font="obliqueLabelFont", align="left")
+        chain_data['groups_layout'] = cmds.columnLayout(adjustableColumn=True, rowSpacing=4)
+        cmds.setParent('..')
+
+        cmds.button(
+            label="+ Add Driven Group (from Ordered Selection)",
+            height=26,
+            command=lambda x, c=chain_data: self.add_fk_group_from_sel(c)
+        )
+
+        cmds.separator(height=8, style='none')
+
+        cmds.button(
+            label="Generate Controllers for this Chain",
+            height=34,
+            backgroundColor=[0.25, 0.5, 0.45],
+            command=lambda x, c=chain_data: self.run_generate_fk_system(c)
+        )
+        
+        cmds.setParent('..') 
+        self.fk_chains_data.append(chain_data)
+        
+        for grp_str in groups:
+            self.add_fk_group_from_sel(chain_data, items_str=grp_str)
+            
+        return chain_data
+
+    def remove_chain_ui(self, chain_data):
+        if cmds.layout(chain_data['frame'], exists=True):
+            cmds.deleteUI(chain_data['frame'])
+        if chain_data in self.fk_chains_data:
+            self.fk_chains_data.remove(chain_data)
+
+    def _populate_field(self, field_widget):
+        sel = cmds.ls(sl=True)
+        if sel:
+            cmds.textField(field_widget, edit=True, text=sel[0])
+
+    def _populate_field_multiple(self, field_widget):
+        sel = cmds.ls(sl=True)
+        if sel:
+            cmds.textField(field_widget, edit=True, text=",".join(sel))
+
+    def add_fk_group_from_sel(self, chain_data, items_str=None):
+        if items_str is None:
+            sel = cmds.ls(sl=True)
+            items_str = ",".join(sel) if sel else ""
+
+        cmds.setParent(chain_data['groups_layout'])
+        row = cmds.rowLayout(numberOfColumns=3, columnWidth3=[210, 48, 38], adjustableColumn=1)
+        tf = cmds.textField(text=items_str, placeholderText="e.g. pSphere1, pSphere2")
+        
+        def reload_row(tf_widget):
+            sel = cmds.ls(sl=True)
+            if sel:
+                cmds.textField(tf_widget, edit=True, text=",".join(sel))
+
+        def remove_row(r_widget, tf_widget):
+            cmds.deleteUI(r_widget)
+            if tf_widget in chain_data['group_fields']:
+                chain_data['group_fields'].remove(tf_widget)
+                
+        cmds.button(label="Reload", command=lambda x, t=tf: reload_row(t))
+        cmds.button(label="Del", command=lambda x, r=row, t=tf: remove_row(r, t))
+        chain_data['group_fields'].append(tf)
+
+    def load_all_fk_caches(self, *args):
+        available_caches = cmds.ls("*ChainCached") or []
+        if not available_caches:
+            cmds.warning("No cache nodes with suffix 'ChainCached' found in the scene.")
+            return
+
+        for c_data in list(self.fk_chains_data):
+            self.remove_chain_ui(c_data)
+
+        for cache_node in available_caches:
+            try:
+                detected_chain_name = cache_node.replace("ChainCached", "")
+                parent_node = cmds.getAttr(f"{cache_node}.parentNode") or ""
+                is_fk = cmds.getAttr(f"{cache_node}.isFk")
+                group_count = cmds.getAttr(f"{cache_node}.groupCount")
+                
+                vis_on_shape = True
+                if cmds.attributeQuery("visOnShape", node=cache_node, exists=True):
+                    vis_on_shape = cmds.getAttr(f"{cache_node}.visOnShape")
+
+                loaded_groups = []
+                for i in range(group_count):
+                    attr_name = f"group_{i}"
+                    if cmds.attributeQuery(attr_name, node=cache_node, exists=True):
+                        grp_str = cmds.getAttr(f"{cache_node}.{attr_name}") or ""
+                        loaded_groups.append(grp_str)
+
+                self.add_fk_chain_ui(
+                    parent_node=parent_node, 
+                    chain_name=detected_chain_name, 
+                    is_fk=is_fk, 
+                    groups=loaded_groups,
+                    vis_on_shape=vis_on_shape
+                )
+            except Exception as e:
+                cmds.warning(f"Error loading cache node '{cache_node}': {e}")
+                
+        print(f"Loaded {len(available_caches)} Cached Chain(s).")
+
+    def run_generate_fk_system(self, chain_data):
+        chain_name = cmds.textField(chain_data['name_field'], query=True, text=True).strip()
+        if not chain_name:
+            cmds.warning("Please provide a Chain Name.")
+            return
+            
+        parent_node = cmds.textField(chain_data['parent_field'], query=True, text=True).strip()
+        is_fk = cmds.checkBox(chain_data['fk_cb'], query=True, value=True)
+        vis_on_shape = cmds.checkBox(chain_data['vis_shape_cb'], query=True, value=True)
+
+        valid_groups = []
+        for tf in chain_data['group_fields']:
+            if cmds.control(tf, exists=True):
+                val = cmds.textField(tf, query=True, text=True).strip()
+                if val:
+                    valid_groups.append(val)
+
+        if not valid_groups:
+            cmds.warning(f"No valid item groups provided for chain '{chain_name}'.")
+            return
+
+        _begin_tool_undo("GenerateFKSystem")
+        try:
+            cache_node = f"{chain_name}ChainCached"
+            if not cmds.objExists(cache_node):
+                cache_node = cmds.group(empty=True, name=cache_node)
+                cmds.setAttr(f"{cache_node}.visibility", 0)
+
+            for attr in ["parentNode", "isFk", "groupCount", "visOnShape"]:
+                if not cmds.attributeQuery(attr, node=cache_node, exists=True):
+                    if attr == "groupCount":
+                        cmds.addAttr(cache_node, ln=attr, at="long")
+                    elif attr in ["isFk", "visOnShape"]:
+                        cmds.addAttr(cache_node, ln=attr, at="bool")
+                    else:
+                        cmds.addAttr(cache_node, ln=attr, dt="string")
+
+            cmds.setAttr(f"{cache_node}.parentNode", parent_node, type="string")
+            cmds.setAttr(f"{cache_node}.isFk", is_fk)
+            cmds.setAttr(f"{cache_node}.visOnShape", vis_on_shape)
+            cmds.setAttr(f"{cache_node}.groupCount", len(valid_groups))
+
+            for i, grp_val in enumerate(valid_groups):
+                attr_name = f"group_{i}"
+                if not cmds.attributeQuery(attr_name, node=cache_node, exists=True):
+                    cmds.addAttr(cache_node, ln=attr_name, dt="string")
+                cmds.setAttr(f"{cache_node}.{attr_name}", grp_val, type="string")
+
+            prev_last_item = None
+            prev_ctrl = None
+            generated_ctrls = []
+            
+            for i, grp_val in enumerate(valid_groups):
+                items = [x.strip() for x in grp_val.split(',') if cmds.objExists(x.strip())]
+                if not items:
+                    continue
+
+                first_item = items[0]
+                last_item = items[-1]
+                ctrl_name = f"{chain_name}_{i+1:02d}_ctrl"
+                offset_name = f"{chain_name}_{i+1:02d}_offset"
+
+                ctrl = cmds.circle(normal=(1,0,0), radius=2.5, name=ctrl_name, ch=False)[0]
+                offset = cmds.group(empty=True, name=offset_name)
+                
+                cmds.parent(ctrl, offset)
+                cmds.matchTransform(offset, first_item, position=True, rotation=True)
+
+                if i == 0:
+                    if parent_node and cmds.objExists(parent_node):
+                        cmds.parent(offset, parent_node)
+                else:
+                    if is_fk and prev_last_item and cmds.objExists(prev_last_item) and prev_ctrl and cmds.objExists(prev_ctrl):
+                        cmds.parent(offset, prev_ctrl)
+                        cmds.parentConstraint(prev_last_item, offset, maintainOffset=True)
+                    elif parent_node and cmds.objExists(parent_node):
+                        cmds.parent(offset, parent_node)
+
+                cmds.addAttr(ctrl, ln="PercentTranslationFollow", at="double", dv=1, keyable=True)
+                cmds.addAttr(ctrl, ln="PercentRotateFollow", at="double", dv=1, keyable=True)
+                cmds.addAttr(ctrl, ln="VisSubController", at="bool", dv=1, keyable=True)
+
+                for item in items:
+                    short_name = item.split('|')[-1]
+                    follow_name = f"{short_name}FollowDriver"
+                    
+                    if cmds.objExists(follow_name):
+                        cmds.warning(f"Group '{follow_name}' already exists. Skipping recreation for '{item}'.")
+                        continue
+
+                    old_parent = cmds.listRelatives(item, parent=True, fullPath=True)
+                    
+                    follow_grp = cmds.group(empty=True, name=follow_name)
+                    cmds.matchTransform(follow_grp, item, position=True, rotation=True)
+                    
+                    if old_parent:
+                        cmds.parent(follow_grp, old_parent[0])
+
+                    cmds.parent(item, follow_grp)
+
+                    curr_t = cmds.getAttr(f"{follow_grp}.translate")[0]
+                    curr_r = cmds.getAttr(f"{follow_grp}.rotate")[0]
+
+                    # Translate Setup
+                    md_t = cmds.createNode("multiplyDivide", name=f"{short_name}_MD_T")
+                    cmds.connectAttr(f"{ctrl}.translate", f"{md_t}.input1")
+                    cmds.connectAttr(f"{ctrl}.PercentTranslationFollow", f"{md_t}.input2X")
+                    cmds.connectAttr(f"{ctrl}.PercentTranslationFollow", f"{md_t}.input2Y")
+                    cmds.connectAttr(f"{ctrl}.PercentTranslationFollow", f"{md_t}.input2Z")
+
+                    pma_t = cmds.createNode("plusMinusAverage", name=f"{short_name}_PMA_T")
+                    cmds.setAttr(f"{pma_t}.input3D[0].input3Dx", curr_t[0])
+                    cmds.setAttr(f"{pma_t}.input3D[0].input3Dy", curr_t[1])
+                    cmds.setAttr(f"{pma_t}.input3D[0].input3Dz", curr_t[2])
+                    
+                    cmds.connectAttr(f"{md_t}.output", f"{pma_t}.input3D[1]")
+                    cmds.connectAttr(f"{pma_t}.output3D", f"{follow_grp}.translate")
+
+                    # Rotate Setup
+                    md_r = cmds.createNode("multiplyDivide", name=f"{short_name}_MD_R")
+                    cmds.connectAttr(f"{ctrl}.rotate", f"{md_r}.input1")
+                    cmds.connectAttr(f"{ctrl}.PercentRotateFollow", f"{md_r}.input2X")
+                    cmds.connectAttr(f"{ctrl}.PercentRotateFollow", f"{md_r}.input2Y")
+                    cmds.connectAttr(f"{ctrl}.PercentRotateFollow", f"{md_r}.input2Z")
+
+                    pma_r = cmds.createNode("plusMinusAverage", name=f"{short_name}_PMA_R")
+                    cmds.setAttr(f"{pma_r}.input3D[0].input3Dx", curr_r[0])
+                    cmds.setAttr(f"{pma_r}.input3D[0].input3Dy", curr_r[1])
+                    cmds.setAttr(f"{pma_r}.input3D[0].input3Dz", curr_r[2])
+                    
+                    cmds.connectAttr(f"{md_r}.output", f"{pma_r}.input3D[1]")
+                    cmds.connectAttr(f"{pma_r}.output3D", f"{follow_grp}.rotate")
+                    
+                    # Visibility Setup based on Checkbox
+                    if vis_on_shape:
+                        item_shapes = cmds.listRelatives(item, shapes=True, fullPath=True)
+                        vis_targets = item_shapes if item_shapes else [item]
+                    else:
+                        vis_targets = [item]
+                        
+                    for v_tgt in vis_targets:
+                        if cmds.getAttr(f"{v_tgt}.visibility", lock=True):
+                            cmds.setAttr(f"{v_tgt}.visibility", lock=False)
+                            
+                        cmds.connectAttr(f"{ctrl}.VisSubController", f"{v_tgt}.visibility", force=True)
+                        cmds.setAttr(f"{v_tgt}.visibility", keyable=False, channelBox=False, lock=True)
+
+                prev_last_item = last_item
+                prev_ctrl = ctrl
+                generated_ctrls.append(ctrl)
+
+            if generated_ctrls:
+                cmds.select(generated_ctrls)
+                print(f"Generated FK System '{chain_name}' mapped to cache '{cache_node}'.")
+
+        finally:
+            _end_tool_undo()
+
+
+
+# ==============================================================================
+# EMBED THE LEGACY MAYA-CMDS TOOLKIT INSIDE THE PYSIDE MASTER WINDOW
+# ==============================================================================
+class EmbeddedUnifiedRiggingToolkit(UnifiedRiggingToolkitUI):
+    """
+    Builds the existing UnifiedRiggingToolkitUI in a hidden Maya host window,
+    then exposes the Maya tabLayout's QWidget so it can be inserted into the
+    PySide MasterRiggingUI as a normal tab.
+
+    All original callbacks and Maya cmds UI controls remain unchanged.
+    """
+
+    WINDOW_NAME = "UnifiedRiggingToolkitEmbeddedHost"
+
+    def create_ui(self):
+        if cmds.window(self.WINDOW_NAME, exists=True):
+            cmds.deleteUI(self.WINDOW_NAME)
+
+        # Hidden Maya host.  Maya still owns/tracks the cmds controls, while
+        # the Qt widget for the tabLayout is reparented into MasterRiggingUI.
+        self.win = cmds.window(
+            self.WINDOW_NAME,
+            title="Embedded Rigging Toolkit Host",
+            widthHeight=(440, 720),
+            sizeable=True,
+            visible=False
+        )
+
+        cmds.columnLayout(adjustableColumn=True)
+        self.tabs = cmds.tabLayout(innerMarginWidth=5, innerMarginHeight=5)
+
+        tab1 = cmds.columnLayout(adjustableColumn=True, rowSpacing=10, columnOffset=["both", 10])
+        self.build_controller_tab(tab1)
+        cmds.setParent('..')
+
+        tab2 = cmds.columnLayout(adjustableColumn=True, rowSpacing=10, columnOffset=["both", 10])
+        self.build_mirror_tab(tab2)
+        cmds.setParent('..')
+
+        tab3 = cmds.columnLayout(adjustableColumn=True, rowSpacing=10, columnOffset=["both", 10])
+        self.build_weight_tab(tab3)
+        cmds.setParent('..')
+
+        tab4 = cmds.columnLayout(adjustableColumn=True, rowSpacing=10, columnOffset=["both", 10])
+        self.build_utils_tab(tab4)
+        cmds.setParent('..')
+
+        tab5 = cmds.columnLayout(adjustableColumn=True, rowSpacing=10, columnOffset=["both", 10])
+        self.build_fk_aim_tab(tab5)
+        cmds.setParent('..')
+
+        cmds.tabLayout(
+            self.tabs,
+            edit=True,
+            tabLabel=[
+                (tab1, 'Auto Controller'),
+                (tab2, 'Mirror Shapes'),
+                (tab3, 'Weight Transfer'),
+                (tab4, 'Naming Utils'),
+                (tab5, 'FK & Aim Utils')
+            ]
+        )
+
+        # Do NOT show the host Maya window.  We only expose its Qt tab widget.
+        ptr = omui.MQtUtil.findControl(self.tabs)
+        if ptr is None:
+            ptr = omui.MQtUtil.findLayout(self.tabs)
+
+        if ptr is None:
+            raise RuntimeError(
+                "Could not resolve embedded Maya tabLayout '{}' to a Qt widget.".format(self.tabs)
+            )
+
+        self.qt_widget = shiboken2.wrapInstance(int(ptr), QtWidgets.QWidget)
+
+    def get_qt_widget(self):
+        return self.qt_widget
+
+
+# =====================================================================
+
+# GLOBAL CONSTANTS
+
+# =====================================================================
+
+SDK_CACHE_NODE = "toolSettingsGroup_SDK"
+
+VTX_CACHE_NODE = "vertexConstraint_CacheNode"
+
+VTX_CACHE_ATTR = "vertex_json_data"
+
+VTX_BUFFER_GROUP = "vertexConstraint_BufferGroup"
+
+def get_maya_main_window():
+
+    ptr = omui.MQtUtil.mainWindow()
+
+    if ptr is not None:
+
+        return shiboken2.wrapInstance(int(ptr), QtWidgets.QMainWindow)
+
+    return None
+
+# =====================================================================
+
+# WIDGET 1: SDK TASK WIDGET (For Tab 1)
+
+# =====================================================================
+
+class SDKTaskWidget(QtWidgets.QFrame):
+
+    def __init__(self, task_id, parent_ui):
+
+        super(SDKTaskWidget, self).__init__()
+
+        self.parent_ui = parent_ui
+
+        self.task_id = task_id
+
+        self.setFrameShape(QtWidgets.QFrame.StyledPanel)
+
+        self.setFrameShadow(QtWidgets.QFrame.Raised)
+
+        main_layout = QtWidgets.QVBoxLayout(self)
+
+        main_layout.setContentsMargins(5, 5, 5, 5)
+
+        # Header
+
+        header_layout = QtWidgets.QHBoxLayout()
+
+        self.btn_toggle = QtWidgets.QPushButton("? Group Task {}".format(self.task_id))
+
+        self.btn_toggle.setStyleSheet("text-align: left; font-weight: bold; background-color: #444;")
+
+        self.btn_delete = QtWidgets.QPushButton("X")
+
+        self.btn_delete.setFixedWidth(30)
+
+        self.btn_delete.setStyleSheet("background-color: #883333; font-weight: bold;")
+
+        header_layout.addWidget(self.btn_toggle)
+
+        header_layout.addWidget(self.btn_delete)
+
+        main_layout.addLayout(header_layout)
+
+        # Content
+
+        self.content_widget = QtWidgets.QWidget()
+
+        content_layout = QtWidgets.QVBoxLayout(self.content_widget)
+
+        self.le_target = QtWidgets.QLineEdit()
+
+        self.le_target.setPlaceholderText("Target Objects (Comma-separated)...")
+
+        self.btn_get_target = QtWidgets.QPushButton("<<")
+
+        self.btn_get_target.setFixedWidth(30)
+
+        target_layout = QtWidgets.QHBoxLayout()
+
+        target_layout.addWidget(QtWidgets.QLabel("Targets:"))
+
+        target_layout.addWidget(self.le_target)
+
+        target_layout.addWidget(self.btn_get_target)
+
+        content_layout.addLayout(target_layout)
+
+        opt_layout = QtWidgets.QFormLayout()
+
+        self.cb_hierarchy = QtWidgets.QComboBox()
+
+        self.cb_hierarchy.addItems(["as Child", "asParent", "World"])
+
+        self.cb_hierarchy.setCurrentIndex(1)
+
+        self.cb_match = QtWidgets.QComboBox()
+
+        self.cb_match.addItems(["match position Only", "match rotation Only", "match Transform", "world"])
+
+        self.cb_match.setCurrentIndex(2)
+
+        self.le_prefix = QtWidgets.QLineEdit()
+
+        self.le_suffix = QtWidgets.QLineEdit()
+
+        self.le_search = QtWidgets.QLineEdit()
+
+        self.le_replace = QtWidgets.QLineEdit()
+
+        opt_layout.addRow("Hierarchy Mode:", self.cb_hierarchy)
+
+        opt_layout.addRow("Match Mode:", self.cb_match)
+
+        opt_layout.addRow("Prefix:", self.le_prefix)
+
+        opt_layout.addRow("Suffix:", self.le_suffix)
+
+        opt_layout.addRow("Search For:", self.le_search)
+
+        opt_layout.addRow("Replace With:", self.le_replace)
+
+        content_layout.addLayout(opt_layout)
+
+        self.btn_transform = QtWidgets.QPushButton("Execute Transform")
+
+        self.btn_transform.setMinimumHeight(35)
+
+        self.btn_transform.setStyleSheet("background-color: #336644; font-weight: bold;")
+
+        content_layout.addWidget(self.btn_transform)
+
+        main_layout.addWidget(self.content_widget)
+
+        # Connections
+
+        self.btn_toggle.clicked.connect(self.toggle_collapse)
+
+        self.btn_delete.clicked.connect(lambda: self.parent_ui.remove_task(self))
+
+        self.btn_get_target.clicked.connect(self.get_selection)
+
+        self.btn_transform.clicked.connect(self.execute_task)
+
+    def toggle_collapse(self):
+
+        is_visible = self.content_widget.isVisible()
+
+        self.content_widget.setVisible(not is_visible)
+
+        self.btn_toggle.setText("? Group Task {}".format(self.task_id) if is_visible else "? Group Task {}".format(self.task_id))
+
+    def get_selection(self):
+
+        sel = cmds.ls(selection=True)
+
+        if sel:
+
+            self.le_target.setText(", ".join(sel))
+
+    def get_data(self):
+
+        return {
+
+            "targets": self.le_target.text(), "hierarchy": self.cb_hierarchy.currentIndex(),
+
+            "match": self.cb_match.currentIndex(), "prefix": self.le_prefix.text(),
+
+            "suffix": self.le_suffix.text(), "search": self.le_search.text(), "replace": self.le_replace.text()
+
+        }
+
+    def set_data(self, data):
+
+        self.le_target.setText(data.get("targets", ""))
+
+        self.cb_hierarchy.setCurrentIndex(data.get("hierarchy", 1))
+
+        self.cb_match.setCurrentIndex(data.get("match", 2))
+
+        self.le_prefix.setText(data.get("prefix", ""))
+
+        self.le_suffix.setText(data.get("suffix", ""))
+
+        self.le_search.setText(data.get("search", ""))
+
+        self.le_replace.setText(data.get("replace", ""))
+
+    def execute_task(self):
+
+        targets = [t.strip() for t in self.le_target.text().split(",") if t.strip()]
+
+        if not targets:
+
+            return cmds.warning("No targets specified!")
+
+        _begin_tool_undo("SDK_Task{}".format(self.task_id))
+
+        try:
+
+            # Save this task's settings as part of the same action.
+            self.parent_ui.save_cache()
+
+            for obj in targets:
+
+                if not cmds.objExists(obj): continue
+
+                short_name = obj.split("|")[-1]
+
+                s, r = self.le_search.text(), self.le_replace.text()
+
+                new_base = short_name.replace(s, r) if s else short_name
+
+                new_name = "{}{}{}".format(self.le_prefix.text(), new_base, self.le_suffix.text())
+
+                sdk_node = cmds.group(empty=True, name=new_name)
+
+                match_mode = self.cb_match.currentText()
+
+                if match_mode == "match position Only": cmds.matchTransform(sdk_node, obj, pos=True, rot=False, scl=False)
+
+                elif match_mode == "match rotation Only": cmds.matchTransform(sdk_node, obj, pos=False, rot=True, scl=False)
+
+                elif match_mode == "match Transform": cmds.matchTransform(sdk_node, obj, pos=True, rot=True, scl=False)
+
+                h_mode = self.cb_hierarchy.currentText()
+
+                if h_mode == "asParent":
+
+                    parent = cmds.listRelatives(obj, parent=True, fullPath=True)
+
+                    if parent: cmds.parent(sdk_node, parent[0])
+
+                    cmds.parent(obj, sdk_node)
+
+                elif h_mode == "as Child": cmds.parent(sdk_node, obj)
+
+            print("SDK Task {} Complete.".format(self.task_id))
+
+        finally:
+
+            _end_tool_undo()
+
+
+# =====================================================================
+
+# WIDGET 2: VERTEX CONSTRAINT GROUP WIDGET (For Tab 2)
+
+# =====================================================================
+
+class VertexGroupWidget(QtWidgets.QFrame):
+
+    def __init__(self, group_id, parent_ui):
+
+        super(VertexGroupWidget, self).__init__()
+
+        self.parent_ui = parent_ui
+
+        self.group_id = group_id
+
+        self.setFrameShape(QtWidgets.QFrame.StyledPanel)
+
+        self.setFrameShadow(QtWidgets.QFrame.Raised)
+
+        main_layout = QtWidgets.QVBoxLayout(self)
+
+        header_layout = QtWidgets.QHBoxLayout()
+
+        self.lbl_title = QtWidgets.QLabel("? Vertex Constraint {}".format(self.group_id))
+
+        self.lbl_title.setStyleSheet("font-weight: bold; background-color: #444; padding: 5px;")
+
+        self.btn_delete = QtWidgets.QPushButton("Delete")
+
+        self.btn_delete.setStyleSheet("background-color: #883333;")
+
+        self.btn_delete.clicked.connect(lambda: self.parent_ui.remove_group(self))
+
+        header_layout.addWidget(self.lbl_title)
+
+        header_layout.addStretch()
+
+        header_layout.addWidget(self.btn_delete)
+
+        main_layout.addLayout(header_layout)
+
+        settings_layout = QtWidgets.QFormLayout()
+
+        vtx_layout, driven_layout = QtWidgets.QHBoxLayout(), QtWidgets.QHBoxLayout()
+
+        self.le_vertex, self.le_driven = QtWidgets.QLineEdit(), QtWidgets.QLineEdit()
+
+        self.btn_vtx, self.btn_driven = QtWidgets.QPushButton("<<"), QtWidgets.QPushButton("<<")
+
+        self.btn_vtx.setFixedWidth(30); self.btn_driven.setFixedWidth(30)
+
+        self.btn_vtx.clicked.connect(self.get_vtx); self.btn_driven.clicked.connect(self.get_driven)
+
+        vtx_layout.addWidget(self.le_vertex); vtx_layout.addWidget(self.btn_vtx)
+
+        driven_layout.addWidget(self.le_driven); driven_layout.addWidget(self.btn_driven)
+
+        self.spn_threshold = QtWidgets.QDoubleSpinBox()
+
+        self.spn_threshold.setRange(0.0, 1.0); self.spn_threshold.setDecimals(4); self.spn_threshold.setValue(0.001)
+
+        self.cb_type = QtWidgets.QComboBox()
+
+        self.cb_type.addItems(["parentConstraint", "PointConstraint", "OrientConstraint"])
+
+        self.chk_mo = QtWidgets.QCheckBox(); self.chk_mo.setChecked(True)
+
+        settings_layout.addRow("Vertex:", vtx_layout)
+
+        settings_layout.addRow("Driven:", driven_layout)
+
+        settings_layout.addRow("Threshold:", self.spn_threshold)
+
+        settings_layout.addRow("Type:", self.cb_type)
+
+        settings_layout.addRow("Maintain Offset:", self.chk_mo)
+
+        main_layout.addLayout(settings_layout)
+
+        self.btn_execute = QtWidgets.QPushButton("Execute Vertex Constraint")
+
+        self.btn_execute.setStyleSheet("background-color: #336644; font-weight: bold;")
+
+        self.btn_execute.clicked.connect(self.execute_logic)
+
+        main_layout.addWidget(self.btn_execute)
+
+    def get_vtx(self):
+
+        sel = cmds.ls(selection=True, flatten=True)
+
+        if sel and ".vtx[" in sel[0]: self.le_vertex.setText(sel[0])
+
+    def get_driven(self):
+
+        sel = cmds.ls(selection=True)
+
+        if sel: self.le_driven.setText(sel[0])
+
+    def get_data(self):
+
+        return {
+
+            "vertex": self.le_vertex.text(), "driven": self.le_driven.text(),
+
+            "threshold": self.spn_threshold.value(), "type": self.cb_type.currentIndex(),
+
+            "maintain_offset": self.chk_mo.isChecked()
+
+        }
+
+    def set_data(self, data):
+
+        self.le_vertex.setText(data.get("vertex", "")); self.le_driven.setText(data.get("driven", ""))
+
+        self.spn_threshold.setValue(data.get("threshold", 0.001))
+
+        self.cb_type.setCurrentIndex(data.get("type", 0))
+
+        self.chk_mo.setChecked(data.get("maintain_offset", True))
+
+    def execute_logic(self):
+
+        vertex, driven, thresh, c_type, mo = self.le_vertex.text(), self.le_driven.text(), self.spn_threshold.value(), self.cb_type.currentText(), self.chk_mo.isChecked()
+
+        if not cmds.objExists(vertex) or not cmds.objExists(driven): return cmds.warning("Invalid Vertex or Driven Object!")
+
+        skin = cmds.ls(cmds.listHistory(vertex), type="skinCluster")
+
+        if not skin: return cmds.warning("No SkinCluster found.")
+
+        infs = cmds.skinCluster(skin[0], q=True, inf=True)
+
+        wgts = cmds.skinPercent(skin[0], vertex, q=True, v=True)
+
+        valid_drvs, valid_wgts = [], []
+
+        for i, w in zip(infs, wgts):
+
+            if w >= thresh: valid_drvs.append(i); valid_wgts.append(w)
+
+        if not valid_drvs: return cmds.warning("No weights found above threshold.")
+
+        _begin_tool_undo("VtxConstraint")
+
+        try:
+
+            if not cmds.objExists(VTX_BUFFER_GROUP): cmds.group(empty=True, name=VTX_BUFFER_GROUP)
+
+            driven_short = driven.split("|")[-1].replace(":", "_")
+
+            old = cmds.ls("bufferLoc_*_to_{}".format(driven_short), type="transform")
+
+            if old: cmds.delete(old)
+
+            wm = cmds.xform(driven, q=True, m=True, ws=True)
+
+            buffers = []
+
+            for drv in valid_drvs:
+
+                loc = cmds.spaceLocator(name="bufferLoc_{}_to_{}".format(drv.split("|")[-1].replace(":", "_"), driven_short))[0]
+
+                cmds.parent(loc, VTX_BUFFER_GROUP)
+
+                cmds.matchTransform(loc, driven, pos=True, rot=True, scl=False)
+
+                cmds.parentConstraint(drv, loc, mo=True)
+
+                buffers.append(loc)
+
+            old_const = cmds.listRelatives(driven, type="constraint")
+
+            if old_const: cmds.delete(old_const)
+
+            cmds.xform(driven, m=wm, ws=True)
+
+            c_node, aliases = None, []
+
+            if c_type == "parentConstraint": 
+
+                c_node = cmds.parentConstraint(buffers, driven, mo=mo)[0]
+
+                aliases = cmds.parentConstraint(c_node, q=True, wal=True)
+
+            elif c_type == "PointConstraint":
+
+                c_node = cmds.pointConstraint(buffers, driven, mo=mo)[0]
+
+                aliases = cmds.pointConstraint(c_node, q=True, wal=True)
+
+            elif c_type == "OrientConstraint":
+
+                c_node = cmds.orientConstraint(buffers, driven, mo=mo)[0]
+
+                aliases = cmds.orientConstraint(c_node, q=True, wal=True)
+
+            if c_node and aliases:
+
+                for a, w in zip(aliases, valid_wgts): cmds.setAttr("{}.{}".format(c_node, a), w)
+
+            self.parent_ui.save_cache()
+
+        finally:
+
+            _end_tool_undo()
+
+
+# =====================================================================
+
+# TABS
+
+# =====================================================================
+
+class TabGroupUtils(QtWidgets.QWidget):
+
+    def __init__(self, parent=None):
+
+        super(TabGroupUtils, self).__init__(parent)
+
+        self.tasks = []
+
+        layout = QtWidgets.QVBoxLayout(self)
+
+        top = QtWidgets.QHBoxLayout()
+
+        btn_add = QtWidgets.QPushButton("+ Add Group Task")
+
+        btn_add.setStyleSheet("background-color: #335577; font-weight: bold; height: 30px;")
+
+        btn_add.clicked.connect(lambda: self.add_task())
+
+        top.addWidget(QtWidgets.QLabel("Cache Node: " + SDK_CACHE_NODE))
+
+        top.addWidget(btn_add)
+
+        layout.addLayout(top)
+
+        # FIXED: Strong reference to the scroll widget to prevent garbage collection
+
+        scroll = QtWidgets.QScrollArea()
+
+        scroll.setWidgetResizable(True)
+
+        self.scroll_widget = QtWidgets.QWidget() 
+
+        self.scroll_layout = QtWidgets.QVBoxLayout(self.scroll_widget)
+
+        self.scroll_layout.addStretch()
+
+        scroll.setWidget(self.scroll_widget)
+
+        layout.addWidget(scroll)
+
+        self.load_cache()
+
+    def add_task(self, data=None):
+
+        task = SDKTaskWidget(len(self.tasks)+1, self)
+
+        if data: task.set_data(data)
+
+        self.scroll_layout.insertWidget(self.scroll_layout.count()-1, task)
+
+        self.tasks.append(task)
+
+    def remove_task(self, task):
+
+        self.scroll_layout.removeWidget(task)
+
+        self.tasks.remove(task)
+
+        task.deleteLater()
+
+        self.save_cache()
+
+    @_non_undoable_cache_write
+    def save_cache(self):
+
+        if not cmds.objExists(SDK_CACHE_NODE): cmds.group(empty=True, name=SDK_CACHE_NODE)
+
+        cmds.setAttr("{}.sdk_json_data".format(SDK_CACHE_NODE), json.dumps([t.get_data() for t in self.tasks]), type="string") if cmds.attributeQuery("sdk_json_data", n=SDK_CACHE_NODE, ex=True) else cmds.addAttr(SDK_CACHE_NODE, ln="sdk_json_data", dt="string")
+
+        cmds.setAttr("{}.sdk_json_data".format(SDK_CACHE_NODE), json.dumps([t.get_data() for t in self.tasks]), type="string")
+
+    def load_cache(self):
+
+        if not cmds.objExists(SDK_CACHE_NODE) or not cmds.attributeQuery("sdk_json_data", n=SDK_CACHE_NODE, ex=True): return self.add_task()
+
+        try:
+
+            for d in json.loads(cmds.getAttr("{}.sdk_json_data".format(SDK_CACHE_NODE))): self.add_task(d)
+
+        except: self.add_task()
+
+
+class TabVertexConstraint(QtWidgets.QWidget):
+
+    def __init__(self, parent=None):
+
+        super(TabVertexConstraint, self).__init__(parent)
+
+        self.groups = []
+
+        layout = QtWidgets.QVBoxLayout(self)
+
+        btn_add = QtWidgets.QPushButton("+ Add Vertex Setup")
+
+        btn_add.setStyleSheet("background-color: #335577; font-weight: bold; height: 30px;")
+
+        btn_add.clicked.connect(lambda: self.add_group())
+
+        layout.addWidget(btn_add)
+
+        # FIXED: Strong reference to the scroll widget to prevent garbage collection
+
+        scroll = QtWidgets.QScrollArea()
+
+        scroll.setWidgetResizable(True)
+
+        self.scroll_widget = QtWidgets.QWidget()
+
+        self.scroll_layout = QtWidgets.QVBoxLayout(self.scroll_widget)
+
+        self.scroll_layout.addStretch()
+
+        scroll.setWidget(self.scroll_widget)
+
+        layout.addWidget(scroll)
+
+        self.load_cache()
+
+    def add_group(self, data=None):
+
+        grp = VertexGroupWidget(len(self.groups)+1, self)
+
+        if data: grp.set_data(data)
+
+        self.scroll_layout.insertWidget(self.scroll_layout.count()-1, grp)
+
+        self.groups.append(grp)
+
+    def remove_group(self, grp):
+
+        self.scroll_layout.removeWidget(grp)
+
+        self.groups.remove(grp)
+
+        grp.deleteLater()
+
+        self.save_cache()
+
+    @_non_undoable_cache_write
+    def save_cache(self):
+
+        if not cmds.objExists(VTX_CACHE_NODE): cmds.spaceLocator(n=VTX_CACHE_NODE)
+
+        if not cmds.attributeQuery(VTX_CACHE_ATTR, n=VTX_CACHE_NODE, ex=True): cmds.addAttr(VTX_CACHE_NODE, ln=VTX_CACHE_ATTR, dt="string")
+
+        cmds.setAttr("{}.{}".format(VTX_CACHE_NODE, VTX_CACHE_ATTR), json.dumps([g.get_data() for g in self.groups]), type="string")
+
+    def load_cache(self):
+
+        if cmds.objExists(VTX_CACHE_NODE) and cmds.attributeQuery(VTX_CACHE_ATTR, n=VTX_CACHE_NODE, ex=True):
+
+            try:
+
+                for d in json.loads(cmds.getAttr("{}.{}".format(VTX_CACHE_NODE, VTX_CACHE_ATTR))): self.add_group(d)
+
+                return
+
+            except: pass
+
+        self.add_group()
+
+
+class TabMiniRig(QtWidgets.QWidget):
+
+    def __init__(self, parent=None):
+
+        super(TabMiniRig, self).__init__(parent)
+
+        layout = QtWidgets.QVBoxLayout(self)
+
+        # Snap Center
+
+        grp1 = QtWidgets.QGroupBox("1. Match Transform to Vertex Center")
+
+        lyt1 = QtWidgets.QVBoxLayout(grp1)
+
+        row1 = QtWidgets.QHBoxLayout()
+
+        self.le_match = QtWidgets.QLineEdit(); self.le_match.setPlaceholderText("Target transform (optional)")
+
+        btn_match = QtWidgets.QPushButton("<< Load"); btn_match.clicked.connect(lambda: self.le_match.setText(cmds.ls(sl=True)[0] if cmds.ls(sl=True) else ""))
+
+        row1.addWidget(self.le_match); row1.addWidget(btn_match)
+
+        btn_snap = QtWidgets.QPushButton("Snap / Create to Center"); btn_snap.setStyleSheet("background-color: #335577; font-weight:bold; height:30px")
+
+        btn_snap.clicked.connect(self.snap_center)
+
+        lyt1.addLayout(row1); lyt1.addWidget(btn_snap)
+
+        # Locators
+
+        grp2 = QtWidgets.QGroupBox("2. Generate Guide Locators")
+
+        lyt2 = QtWidgets.QFormLayout(grp2)
+
+        r_row = QtWidgets.QHBoxLayout(); self.le_root = QtWidgets.QLineEdit(); btn_r = QtWidgets.QPushButton("<<"); btn_r.clicked.connect(lambda: self.le_root.setText(cmds.ls(sl=True)[0] if cmds.ls(sl=True) else ""))
+
+        r_row.addWidget(self.le_root); r_row.addWidget(btn_r)
+
+        s_row = QtWidgets.QHBoxLayout(); self.le_sel = QtWidgets.QLineEdit(); btn_s = QtWidgets.QPushButton("<<"); btn_s.clicked.connect(lambda: self.le_sel.setText(",".join(cmds.ls(sl=True))))
+
+        s_row.addWidget(self.le_sel); s_row.addWidget(btn_s)
+
+        self.chk_sel = QtWidgets.QCheckBox("Selection Only"); self.spn_rad = QtWidgets.QDoubleSpinBox(); self.spn_rad.setValue(1.0)
+
+        self.spn_rad.valueChanged.connect(self.update_live)
+
+        lyt2.addRow("Root:", r_row); lyt2.addRow("List:", s_row)
+
+        lyt2.addRow("", self.chk_sel); lyt2.addRow("Radius:", self.spn_rad)
+
+        b_row = QtWidgets.QHBoxLayout()
+
+        bg = QtWidgets.QPushButton("Generate"); bg.setStyleSheet("background-color: #336644; height:30px"); bg.clicked.connect(self.gen_locs)
+
+        bc = QtWidgets.QPushButton("Clean All"); bc.setStyleSheet("background-color: #883333; height:30px"); bc.clicked.connect(self.clean_all_guides)
+
+        b_row.addWidget(bg); b_row.addWidget(bc)
+
+        lyt2.addRow(b_row)
+
+        # Orient Joint
+
+        grp3 = QtWidgets.QGroupBox("3. Orient Joint")
+
+        lyt3 = QtWidgets.QFormLayout(grp3)
+
+        self.cb_orient_aim_axis = QtWidgets.QComboBox()
+        self.cb_orient_aim_axis.addItems(["X", "Y", "Z", "-X", "-Y", "-Z"])
+        self.cb_orient_aim_axis.setCurrentText("X")
+
+        self.cb_orient_up_axis = QtWidgets.QComboBox()
+        self.cb_orient_up_axis.addItems(["X", "Y", "Z", "-X", "-Y", "-Z"])
+        self.cb_orient_up_axis.setCurrentText("Y")
+
+        self.cb_orient_up_mode = QtWidgets.QComboBox()
+        self.cb_orient_up_mode.addItems(["Scene Up", "Object Rotation Up", "Object Up"])
+        self.cb_orient_up_mode.setCurrentText("Scene Up")
+
+        up_ref_row = QtWidgets.QHBoxLayout()
+        self.le_orient_up_object = QtWidgets.QLineEdit()
+        self.le_orient_up_object.setPlaceholderText("Used by Object Up modes; blank = joint parent")
+        self.btn_orient_up_object = QtWidgets.QPushButton("<<")
+        self.btn_orient_up_object.setFixedWidth(30)
+        self.btn_orient_up_object.clicked.connect(self.load_orient_up_object)
+        up_ref_row.addWidget(self.le_orient_up_object)
+        up_ref_row.addWidget(self.btn_orient_up_object)
+
+        # Scene Up does not use an Up Object. Disable these controls so the
+        # UI makes that behavior explicit, and re-enable them for object modes.
+        self.cb_orient_up_mode.currentTextChanged.connect(self.update_orient_up_object_state)
+        self.update_orient_up_object_state(self.cb_orient_up_mode.currentText())
+
+        self.chk_orient_children = QtWidgets.QCheckBox("Apply Children")
+        self.chk_orient_children.setChecked(False)
+
+        btn_orient = QtWidgets.QPushButton("Apply Orient Joint")
+        btn_orient.setStyleSheet("background-color: #665533; font-weight:bold; height:30px")
+        btn_orient.clicked.connect(self.orient_joints)
+
+        lyt3.addRow("Aim Axis:", self.cb_orient_aim_axis)
+        lyt3.addRow("Up Axis:", self.cb_orient_up_axis)
+        lyt3.addRow("Up Mode:", self.cb_orient_up_mode)
+        lyt3.addRow("Up Object:", up_ref_row)
+        lyt3.addRow("", self.chk_orient_children)
+        lyt3.addRow(btn_orient)
+
+        # --------------------------------------------------------------
+        # Object-axis orientation offset
+        # --------------------------------------------------------------
+        orient_divider = QtWidgets.QFrame()
+        orient_divider.setFrameShape(QtWidgets.QFrame.HLine)
+        orient_divider.setFrameShadow(QtWidgets.QFrame.Sunken)
+        lyt3.addRow(orient_divider)
+
+        object_axis_label = QtWidgets.QLabel("Rotate Joint Orient Around Object Axis")
+        object_axis_label.setStyleSheet("font-weight: bold;")
+        lyt3.addRow(object_axis_label)
+
+        self.spn_orient_rot_x = QtWidgets.QDoubleSpinBox()
+        self.spn_orient_rot_y = QtWidgets.QDoubleSpinBox()
+        self.spn_orient_rot_z = QtWidgets.QDoubleSpinBox()
+
+        for spin in (self.spn_orient_rot_x, self.spn_orient_rot_y, self.spn_orient_rot_z):
+            spin.setRange(-3600.0, 3600.0)
+            spin.setDecimals(3)
+            spin.setSingleStep(1.0)
+            spin.setValue(0.0)
+            spin.setSuffix(" deg")
+
+        self.chk_object_rotate_children = QtWidgets.QCheckBox("Apply Children")
+        self.chk_object_rotate_children.setChecked(False)
+
+        btn_object_rotate = QtWidgets.QPushButton("Apply Object Axis Rotation")
+        btn_object_rotate.setStyleSheet("background-color: #4f5f6f; font-weight:bold; height:30px")
+        btn_object_rotate.clicked.connect(self.rotate_joint_object_axis)
+
+        lyt3.addRow("Rot Axis X:", self.spn_orient_rot_x)
+        lyt3.addRow("Rot Axis Y:", self.spn_orient_rot_y)
+        lyt3.addRow("Rot Axis Z:", self.spn_orient_rot_z)
+        lyt3.addRow("", self.chk_object_rotate_children)
+        lyt3.addRow(btn_object_rotate)
+
+        # Cleanup Keys
+
+        grp4 = QtWidgets.QGroupBox("4. Safe Delete Timeline Keyframes")
+
+        lyt4 = QtWidgets.QVBoxLayout(grp4)
+
+        self.rad_sel = QtWidgets.QRadioButton("Selected & Hierarchy Below"); self.rad_all = QtWidgets.QRadioButton("All Objects in Scene")
+
+        self.rad_all.setChecked(True)
+
+        btn_del = QtWidgets.QPushButton("Wipe Keys"); btn_del.setStyleSheet("background-color: #883333; font-weight:bold; height:30px")
+
+        btn_del.clicked.connect(self.del_keys)
+
+        lyt4.addWidget(self.rad_sel); lyt4.addWidget(self.rad_all); lyt4.addWidget(btn_del)
+
+        layout.addWidget(grp1); layout.addWidget(grp2); layout.addWidget(grp3); layout.addWidget(grp4); layout.addStretch()
+
+    def snap_center(self):
+
+        vtx = cmds.filterExpand(ex=True, sm=31)
+
+        if not vtx:
+            return cmds.warning("Select vertices first!")
+
+        _begin_tool_undo("MiniRig_SnapCenter")
+        try:
+            bb = cmds.exactWorldBoundingBox(vtx)
+            cx, cy, cz = (bb[0]+bb[3])/2, (bb[1]+bb[4])/2, (bb[2]+bb[5])/2
+
+            tgt = self.le_match.text()
+            if not tgt or not cmds.objExists(tgt):
+                tgt = cmds.spaceLocator(n="vtx_center_loc")[0]
+                self.le_match.setText(tgt)
+
+            cmds.xform(tgt, ws=True, t=[cx, cy, cz])
+        finally:
+            _end_tool_undo()
+
+    def gen_locs(self):
+
+        tgts = [t.strip() for t in self.le_sel.text().split(",") if cmds.objExists(t.strip())] if self.chk_sel.isChecked() else ([self.le_root.text()] + (cmds.listRelatives(self.le_root.text(), ad=True, typ="transform", f=True) or [])) if cmds.objExists(self.le_root.text()) else []
+
+        if not tgts:
+            return cmds.warning("No valid guide targets found.")
+
+        _begin_tool_undo("MiniRig_GenerateGuides")
+        try:
+            for t in tgts:
+                if cmds.objExists(t.split("|")[-1]+"_GuideLoc"):
+                    continue
+
+                loc = cmds.spaceLocator(n=t.split("|")[-1]+"_GuideLoc")[0]
+                cmds.matchTransform(loc, t)
+                cmds.parent(loc, t)
+
+            # Nested call joins this same Generate action.
+            self.update_live(self.spn_rad.value())
+        finally:
+            _end_tool_undo()
+
+    def update_live(self, val):
+
+        _begin_tool_undo("MiniRig_UpdateGuideRadius")
+        try:
+            for loc in cmds.ls("*_GuideLoc", type="transform"):
+                shapes = cmds.listRelatives(loc, s=True) or []
+                if shapes:
+                    shape = shapes[0]
+                    cmds.setAttr(shape+".localScaleX", val)
+                    cmds.setAttr(shape+".localScaleY", val)
+                    cmds.setAttr(shape+".localScaleZ", val)
+        finally:
+            _end_tool_undo()
+
+    def clean_all_guides(self):
+
+        guides = cmds.ls("*_GuideLoc", type="transform") or []
+        if not guides:
+            return
+
+        _begin_tool_undo("MiniRig_CleanGuides")
+        try:
+            cmds.delete(guides)
+        finally:
+            _end_tool_undo()
+
+    def update_orient_up_object_state(self, mode=None):
+
+        mode = mode or self.cb_orient_up_mode.currentText()
+        use_object = mode != "Scene Up"
+        self.le_orient_up_object.setEnabled(use_object)
+        self.btn_orient_up_object.setEnabled(use_object)
+
+    def load_orient_up_object(self):
+
+        # Scene Up intentionally ignores Up Object.
+        if self.cb_orient_up_mode.currentText() == "Scene Up":
+            return
+
+        sel = cmds.ls(sl=True, long=True) or []
+        if sel:
+            self.le_orient_up_object.setText(sel[0])
+
+    @staticmethod
+    def _orient_axis_vector(axis_name):
+
+        axis_map = {
+            "X": (1, 0, 0),
+            "Y": (0, 1, 0),
+            "Z": (0, 0, 1),
+            "-X": (-1, 0, 0),
+            "-Y": (0, -1, 0),
+            "-Z": (0, 0, -1),
+        }
+        return axis_map.get(axis_name, (1, 0, 0))
+
+    @staticmethod
+    def _orient_axis_family(axis_name):
+
+        return axis_name.replace("-", "")
+
+    def _collect_joints_for_orient(self, roots, apply_children):
+
+        joints = []
+        seen = set()
+
+        for root in roots:
+            root_long = (cmds.ls(root, long=True) or [root])[0]
+            candidates = [root_long]
+
+            if apply_children:
+                candidates.extend(
+                    cmds.listRelatives(
+                        root_long,
+                        allDescendents=True,
+                        type="joint",
+                        fullPath=True
+                    ) or []
+                )
+
+            for jnt in candidates:
+                long_name = (cmds.ls(jnt, long=True) or [jnt])[0]
+                if long_name not in seen:
+                    seen.add(long_name)
+                    joints.append(long_name)
+
+        # Parent first.  This is important when Apply Children is enabled:
+        # every parent is oriented before its child is processed.
+        joints.sort(key=lambda node: node.count("|"))
+        return joints
+
+    @staticmethod
+    def _save_descendant_world_transforms(joint):
+        """Snapshot descendant DAG transforms in world space.
+
+        Reorienting a parent joint changes the evaluated world transform of its
+        children.  Saving only translation is not enough: child world rotation
+        (and potentially scale) can still change.  Store the complete world
+        matrix so an orientation edit can leave the rest of the hierarchy
+        visually and spatially untouched.
+        """
+
+        descendants = cmds.listRelatives(
+            joint,
+            allDescendents=True,
+            fullPath=True
+        ) or []
+
+        result = []
+        for child in descendants:
+            if not cmds.objExists(child):
+                continue
+
+            # Shapes do not have an independently editable transform matrix.
+            # Preserve joints and ordinary transform nodes only.
+            node_type = cmds.nodeType(child)
+            if node_type not in ("joint", "transform"):
+                continue
+
+            try:
+                world_matrix = cmds.xform(
+                    child,
+                    query=True,
+                    worldSpace=True,
+                    matrix=True
+                )
+                result.append((child, world_matrix))
+            except Exception as exc:
+                cmds.warning(
+                    "Could not snapshot child world transform '{}': {}".format(
+                        child, exc
+                    )
+                )
+
+        # Restore parent descendants first, then deeper nodes.  A deeper node's
+        # final matrix is therefore applied after all of its ancestors have been
+        # restored.
+        result.sort(key=lambda item: item[0].count("|"))
+        return result
+
+    @staticmethod
+    def _restore_descendant_world_transforms(saved_transforms):
+
+        for child, world_matrix in saved_transforms:
+            if cmds.objExists(child):
+                try:
+                    cmds.xform(
+                        child,
+                        worldSpace=True,
+                        matrix=world_matrix
+                    )
+                except Exception as exc:
+                    cmds.warning(
+                        "Could not restore child world transform '{}': {}".format(
+                            child, exc
+                        )
+                    )
+
+    def orient_joints(self):
+
+        # Preserve the user's exact selection state. Temporary constraints/buffers
+        # created during the orient solve can otherwise change Maya's selection.
+        original_selection = cmds.ls(sl=True, long=True) or []
+
+        selected = cmds.ls(sl=True, type="joint", long=True) or []
+        if not selected:
+            return cmds.warning("Select at least one joint to orient.")
+
+        aim_axis_name = self.cb_orient_aim_axis.currentText()
+        up_axis_name = self.cb_orient_up_axis.currentText()
+
+        if self._orient_axis_family(aim_axis_name) == self._orient_axis_family(up_axis_name):
+            return cmds.warning("Aim Axis and Up Axis cannot use the same axis.")
+
+        aim_vec = self._orient_axis_vector(aim_axis_name)
+        up_vec = self._orient_axis_vector(up_axis_name)
+        up_mode_label = self.cb_orient_up_mode.currentText()
+        apply_children = self.chk_orient_children.isChecked()
+
+        # Scene Up never reads or validates the Up Object field. A stale or
+        # missing object in that field must not block Scene Up orientation.
+        explicit_up_object = ""
+        if up_mode_label != "Scene Up":
+            explicit_up_object = self.le_orient_up_object.text().strip()
+            if explicit_up_object and not cmds.objExists(explicit_up_object):
+                return cmds.warning("Up Object '{}' does not exist.".format(explicit_up_object))
+
+        joints = self._collect_joints_for_orient(selected, apply_children)
+        if not joints:
+            return cmds.warning("No valid joints found to orient.")
+
+        def _make_world_buffer(source, suffix):
+            """Create an unparented transform that snapshots source's world matrix.
+
+            The helper has no DAG dependency on the joint being oriented, so using it
+            as an aim/up reference cannot create the child->parent evaluation cycle
+            that occurs when the live child joint is used directly.
+            """
+            if not source or not cmds.objExists(source):
+                return None
+
+            short_name = source.split("|")[-1].replace(":", "_")
+            buffer_node = cmds.createNode(
+                "transform",
+                name="{}_{}#".format(short_name, suffix)
+            )
+
+            world_matrix = cmds.xform(
+                source,
+                query=True,
+                worldSpace=True,
+                matrix=True
+            )
+            cmds.xform(
+                buffer_node,
+                worldSpace=True,
+                matrix=world_matrix
+            )
+            return buffer_node
+
+        _begin_tool_undo("MiniRig_OrientJoint")
+        oriented_count = 0
+        skipped_count = 0
+
+        try:
+            for joint in joints:
+                if not cmds.objExists(joint):
+                    skipped_count += 1
+                    continue
+
+                child_joints = cmds.listRelatives(
+                    joint,
+                    children=True,
+                    type="joint",
+                    fullPath=True
+                ) or []
+
+                if not child_joints:
+                    # A leaf joint has no direction to aim toward.
+                    skipped_count += 1
+                    continue
+
+                # If a joint branches, use the first child as the orientation
+                # direction.  IMPORTANT: do not aim at this live child directly,
+                # because child.worldMatrix depends on the parent joint and would
+                # create an aimConstraint evaluation cycle.
+                aim_target = child_joints[0]
+
+                saved_transforms = self._save_descendant_world_transforms(joint)
+
+                # Up object: explicit UI object wins. Otherwise use the joint's
+                # current parent as a convenient reference for object-based modes.
+                up_object = explicit_up_object
+                if not up_object:
+                    parent = cmds.listRelatives(joint, parent=True, fullPath=True) or []
+                    if parent:
+                        up_object = parent[0]
+
+                constraint = None
+                aim_buffer = None
+                up_buffer = None
+
+                try:
+                    # Snapshot the child before changing the parent joint.  This is
+                    # the key cycle-safe target used by the temporary aimConstraint.
+                    aim_buffer = _make_world_buffer(
+                        aim_target,
+                        "OrientAimBuffer"
+                    )
+                    if not aim_buffer:
+                        raise RuntimeError(
+                            "Could not create aim buffer for '{}'".format(aim_target)
+                        )
+
+                    if up_mode_label == "Scene Up":
+                        constraint = cmds.aimConstraint(
+                            aim_buffer,
+                            joint,
+                            aimVector=aim_vec,
+                            upVector=up_vec,
+                            worldUpType="scene",
+                            maintainOffset=False
+                        )[0]
+
+                    elif up_object and cmds.objExists(up_object):
+                        # Buffer the up reference as well. This is especially
+                        # important when the explicit Up Object lives somewhere
+                        # under the joint hierarchy being reoriented.
+                        up_buffer = _make_world_buffer(
+                            up_object,
+                            "OrientUpBuffer"
+                        )
+                        if not up_buffer:
+                            raise RuntimeError(
+                                "Could not create up buffer for '{}'".format(up_object)
+                            )
+
+                        world_up_type = (
+                            "objectrotation"
+                            if up_mode_label == "Object Rotation Up"
+                            else "object"
+                        )
+
+                        constraint = cmds.aimConstraint(
+                            aim_buffer,
+                            joint,
+                            aimVector=aim_vec,
+                            upVector=up_vec,
+                            worldUpType=world_up_type,
+                            worldUpObject=up_buffer,
+                            worldUpVector=up_vec,
+                            maintainOffset=False
+                        )[0]
+
+                    else:
+                        # Object-based modes need an up reference. If none exists,
+                        # use the default Scene Up behavior rather than failing.
+                        cmds.warning(
+                            "Joint '{}' has no Up Object; using Scene Up.".format(joint)
+                        )
+                        constraint = cmds.aimConstraint(
+                            aim_buffer,
+                            joint,
+                            aimVector=aim_vec,
+                            upVector=up_vec,
+                            worldUpType="scene",
+                            maintainOffset=False
+                        )[0]
+
+                    # Bake the solved rotation: remove the temporary solver first,
+                    # then push the current joint rotate into jointOrient.
+                    if constraint and cmds.objExists(constraint):
+                        cmds.delete(constraint)
+                        constraint = None
+
+                    cmds.makeIdentity(
+                        joint,
+                        apply=True,
+                        translate=False,
+                        rotate=True,
+                        scale=False,
+                        normal=False
+                    )
+
+                    oriented_count += 1
+
+                except Exception as exc:
+                    cmds.warning("Could not orient '{}': {}".format(joint, exc))
+                    skipped_count += 1
+
+                finally:
+                    if constraint and cmds.objExists(constraint):
+                        cmds.delete(constraint)
+
+                    # Delete world-space helper transforms after the solve. They are
+                    # temporary only and do not remain in the user's rig.
+                    temp_nodes = [
+                        node for node in (aim_buffer, up_buffer)
+                        if node and cmds.objExists(node)
+                    ]
+                    if temp_nodes:
+                        cmds.delete(temp_nodes)
+
+                    # Preserve the hierarchy exactly: descendants return to the full
+                    # world transforms they had before this joint was reoriented.
+                    self._restore_descendant_world_transforms(saved_transforms)
+
+            print(
+                "Orient Joint complete. Oriented: {} | Skipped/leaf: {}".format(
+                    oriented_count, skipped_count
+                )
+            )
+
+        finally:
+            _end_tool_undo()
+
+            # Selection restoration is UI state, not part of the rig edit. Keep it
+            # out of Maya's undo queue so Apply Orient Joint remains one undo step.
+            undo_was_enabled = cmds.undoInfo(query=True, state=True)
+            try:
+                if undo_was_enabled:
+                    cmds.undoInfo(stateWithoutFlush=False)
+
+                valid_selection = [
+                    item for item in original_selection
+                    if cmds.objExists(item)
+                ]
+
+                if valid_selection:
+                    cmds.select(valid_selection, replace=True)
+                else:
+                    cmds.select(clear=True)
+            finally:
+                if undo_was_enabled:
+                    cmds.undoInfo(stateWithoutFlush=True)
+
+    def rotate_joint_object_axis(self):
+
+        # Preserve the exact user selection.  Object-axis orientation is a rig
+        # edit and should not leave helper/descendant joints selected afterward.
+        original_selection = cmds.ls(sl=True, long=True) or []
+
+        selected = cmds.ls(sl=True, type="joint", long=True) or []
+        if not selected:
+            return cmds.warning("Select at least one joint to rotate around its object axis.")
+
+        rot_x = self.spn_orient_rot_x.value()
+        rot_y = self.spn_orient_rot_y.value()
+        rot_z = self.spn_orient_rot_z.value()
+
+        if abs(rot_x) < 1e-10 and abs(rot_y) < 1e-10 and abs(rot_z) < 1e-10:
+            return cmds.warning("Rot Axis X/Y/Z are all 0. Nothing to apply.")
+
+        apply_children = self.chk_object_rotate_children.isChecked()
+        joints = self._collect_joints_for_orient(selected, apply_children)
+        if not joints:
+            return cmds.warning("No valid joints found for Object Axis Rotation.")
+
+        _begin_tool_undo("MiniRig_ObjectAxisJointOrient")
+        rotated_count = 0
+        skipped_count = 0
+
+        try:
+            for joint in joints:
+                if not cmds.objExists(joint):
+                    skipped_count += 1
+                    continue
+
+                # Rotating a parent normally moves its descendants.  Snapshot their full
+                # world transforms first so this operation changes only this joint's
+                # orientation, not child position/rotation/scale in world space.
+                saved_transforms = self._save_descendant_world_transforms(joint)
+
+                try:
+                    # relative + objectSpace means X/Y/Z are interpreted around the
+                    # joint's CURRENT local/object axes, not world axes.
+                    cmds.rotate(
+                        rot_x,
+                        rot_y,
+                        rot_z,
+                        joint,
+                        relative=True,
+                        objectSpace=True
+                    )
+
+                    # This is an orient-edit tool, not an animation rotate tool.
+                    # Bake the local rotation into jointOrient so rotate channels
+                    # return to zero while the new object-axis orientation remains.
+                    cmds.makeIdentity(
+                        joint,
+                        apply=True,
+                        translate=False,
+                        rotate=True,
+                        scale=False,
+                        normal=False
+                    )
+
+                    rotated_count += 1
+
+                except Exception as exc:
+                    skipped_count += 1
+                    cmds.warning(
+                        "Could not apply Object Axis Rotation to '{}': {}".format(
+                            joint, exc
+                        )
+                    )
+
+                finally:
+                    self._restore_descendant_world_transforms(saved_transforms)
+
+            print(
+                "Object Axis Joint Orient complete. Rotated: {} | Skipped: {} | "
+                "Offset: ({:.3f}, {:.3f}, {:.3f})".format(
+                    rotated_count, skipped_count, rot_x, rot_y, rot_z
+                )
+            )
+
+        finally:
+            _end_tool_undo()
+
+            # Selection is UI state. Restore it without adding another item to the
+            # Maya undo queue, preserving the one-button = one-undo behavior.
+            undo_was_enabled = cmds.undoInfo(query=True, state=True)
+            try:
+                if undo_was_enabled:
+                    cmds.undoInfo(stateWithoutFlush=False)
+
+                valid_selection = [
+                    item for item in original_selection
+                    if cmds.objExists(item)
+                ]
+
+                if valid_selection:
+                    cmds.select(valid_selection, replace=True)
+                else:
+                    cmds.select(clear=True)
+            finally:
+                if undo_was_enabled:
+                    cmds.undoInfo(stateWithoutFlush=True)
+
+    def del_keys(self):
+
+        _begin_tool_undo("MiniRig_SafeDeleteKeys")
+
+        try:
+
+            if self.rad_sel.isChecked():
+
+                sel = cmds.ls(sl=True)
+
+                if not sel: return cmds.warning("Nothing selected!")
+
+                cnt = cmds.cutKey(sel, hierarchy="below", clear=True)
+
+                print("Deleted {} keys from hierarchy.".format(cnt))
+
+            else:
+
+                curves = [c for c in cmds.ls(type=['animCurveTA', 'animCurveTL', 'animCurveTT', 'animCurveTU']) if not cmds.lockNode(c, q=True)[0] and not cmds.referenceQuery(c, inr=True)]
+
+                if curves: cmds.delete(curves); print("Wiped {} animation curves.".format(len(curves)))
+
+        finally:
+
+            _end_tool_undo()
+
+
+# =====================================================================
+
+# MASTER WINDOW
+
+# =====================================================================
+
+class MasterRiggingUI(QtWidgets.QDialog):
+
+    def __init__(self, parent=get_maya_main_window()):
+
+        super(MasterRiggingUI, self).__init__(parent)
+
+        self.setWindowTitle("Master Rigging Toolkit")
+
+        self.setWindowFlags(self.windowFlags() ^ QtCore.Qt.WindowContextHelpButtonHint)
+
+        self.resize(500, 650)
+
+        layout = QtWidgets.QVBoxLayout(self)
+
+        self.tabs = QtWidgets.QTabWidget()
+
+        self.tabs.addTab(TabGroupUtils(), "1. Group SDK Setup")
+
+        self.tabs.addTab(TabVertexConstraint(), "2. Vertex Constraints")
+
+        self.tabs.addTab(TabMiniRig(), "3. MiniRig Guides")
+
+        # ------------------------------------------------------------------
+        # TAB 4: Existing Unified Rigging / FK / AimDistance Toolkit
+        # ------------------------------------------------------------------
+        self.unified_tool = EmbeddedUnifiedRiggingToolkit()
+
+        unified_page = QtWidgets.QWidget()
+        unified_layout = QtWidgets.QVBoxLayout(unified_page)
+        unified_layout.setContentsMargins(0, 0, 0, 0)
+
+        self.unified_tool_widget = self.unified_tool.get_qt_widget()
+        self.unified_tool_widget.setParent(unified_page)
+        unified_layout.addWidget(self.unified_tool_widget)
+
+        self.tabs.addTab(unified_page, "4. Rigging & Skinning")
+
+        layout.addWidget(self.tabs)
+
+
+
+# ==============================================================================
+# LAUNCH
+# ==============================================================================
+global _master_rig_ui
+try:
+    _master_rig_ui.close()
+    _master_rig_ui.deleteLater()
+except Exception:
+    pass
+
+_master_rig_ui = MasterRiggingUI()
+_master_rig_ui.show()

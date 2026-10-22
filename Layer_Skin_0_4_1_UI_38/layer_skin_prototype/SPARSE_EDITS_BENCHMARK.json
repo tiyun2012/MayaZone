@@ -1,0 +1,91 @@
+{
+  "python": "3.12.14",
+  "platform": "Linux-6.18.55-x86_64-with-glibc2.39",
+  "numpy": "2.3.5",
+  "repeats": 5,
+  "limitation": "CPU phases only; excludes native Maya reads/writes, reference serialization in other workflows and viewport timing.",
+  "composition": [
+    {
+      "ui37_median_ms": 186.4718,
+      "ui38_median_ms": 119.0821,
+      "phase_speedup": 1.57,
+      "vertices": 100000,
+      "influences": 64,
+      "opacity": 1.0,
+      "unique_sparse_rows": 16,
+      "scope": "Full CPU composite of existing sparse assignment rows"
+    },
+    {
+      "ui37_median_ms": 1083.7896,
+      "ui38_median_ms": 480.1881,
+      "phase_speedup": 2.26,
+      "vertices": 100000,
+      "influences": 64,
+      "opacity": 0.5,
+      "unique_sparse_rows": 16,
+      "scope": "Full CPU composite of existing sparse assignment rows"
+    },
+    {
+      "ui37_median_ms": 196.4626,
+      "ui38_median_ms": 197.4782,
+      "phase_speedup": 0.99,
+      "vertices": 100000,
+      "influences": 64,
+      "opacity": 1.0,
+      "unique_sparse_rows": 100000,
+      "scope": "Full CPU composite of existing sparse assignment rows"
+    }
+  ],
+  "manual_serialization": {
+    "ui37_median_ms": 520.0501,
+    "ui38_median_ms": 99.0141,
+    "phase_speedup": 5.25,
+    "vertices": 40000,
+    "influences": 64,
+    "ui37_encoded_characters": 190440,
+    "ui38_encoded_characters": 161616,
+    "ui37_raw_json_bytes": 11883773,
+    "ui38_raw_json_bytes": 3923773,
+    "ui37_unique_weight_rows": 40000,
+    "ui38_unique_weight_rows": 1,
+    "scope": "State validation + encode: UI 37 dense manual-row policy versus UI 38 compact shared rows; packed base warmed"
+  },
+  "scattered": [
+    {
+      "ui37_median_ms": 0.0087,
+      "ui38_median_ms": 0.0057,
+      "phase_speedup": 1.52,
+      "vertices": 100000,
+      "influences": 64,
+      "candidate_vertices": 4,
+      "scope": "Scattered packed-row detection only; native guards unchanged"
+    },
+    {
+      "ui37_median_ms": 0.1194,
+      "ui38_median_ms": 0.0513,
+      "phase_speedup": 2.33,
+      "vertices": 100000,
+      "influences": 64,
+      "candidate_vertices": 64,
+      "scope": "Scattered packed-row detection only; native guards unchanged"
+    },
+    {
+      "ui37_median_ms": 2.3677,
+      "ui38_median_ms": 1.0903,
+      "phase_speedup": 2.17,
+      "vertices": 100000,
+      "influences": 64,
+      "candidate_vertices": 1024,
+      "scope": "Scattered packed-row detection only; native guards unchanged"
+    },
+    {
+      "ui37_median_ms": 22.6619,
+      "ui38_median_ms": 7.8526,
+      "phase_speedup": 2.89,
+      "vertices": 100000,
+      "influences": 64,
+      "candidate_vertices": 8192,
+      "scope": "Scattered packed-row detection only; native guards unchanged"
+    }
+  ]
+}

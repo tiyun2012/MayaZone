@@ -1,0 +1,6 @@
+Pure Python Relax benchmark; excludes Maya API, skin writes, metadata encoding and viewport costs.
+Vertices: 20000; influences: 20; iterations: 5; strength: 0.5; max new: 2
+Whole-mesh solver: 0.361817 seconds; changed rows: 190
+100 selected vertices: 0.029533 seconds; changed rows: 10
+One-ring neighbors outside the selected scope are fixed. All iterations precede one native authoring command.
+Solver preprocessing reads authored rows; the adjacency cache separately avoids repeat native neighbor queries.

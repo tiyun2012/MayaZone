@@ -1,0 +1,35 @@
+{
+  "python": "3.12.14",
+  "vertices": 100000,
+  "influences": 339,
+  "scope": "CPU-only generator; excludes Maya native IO, binding, metadata encoding and viewport",
+  "methods": {
+    "point": {
+      "seconds": 1.25332,
+      "cached_seconds": 0.015433,
+      "candidate_tests": 257118,
+      "full_pair_tests": 33900000,
+      "assigned_vertices": 100000,
+      "sparse_rows": true,
+      "verified": true
+    },
+    "bone": {
+      "seconds": 1.263387,
+      "cached_seconds": 0.018684,
+      "candidate_tests": 284099,
+      "full_pair_tests": 33900000,
+      "assigned_vertices": 100000,
+      "sparse_rows": true,
+      "verified": true
+    },
+    "axis": {
+      "seconds": 1.258002,
+      "cached_seconds": 0.018355,
+      "candidate_tests": 284099,
+      "full_pair_tests": 33900000,
+      "assigned_vertices": 100000,
+      "sparse_rows": true,
+      "verified": true
+    }
+  }
+}
