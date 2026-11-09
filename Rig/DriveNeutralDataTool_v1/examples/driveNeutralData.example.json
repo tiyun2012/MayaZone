@@ -1,0 +1,113 @@
+{
+  "schema": "driveNeutralData",
+  "version": 1,
+  "translation_only": true,
+  "coordinate_space": "world",
+  "position_unit": "centimeter",
+  "created_utc": "2026-10-18T17:10:55.545417+00:00",
+  "updated_utc": "2026-10-18T17:10:55.545477+00:00",
+  "source_scene": "SYNTHETIC_EXAMPLE_NOT_YOUR_RIG.ma",
+  "maya_display_linear_unit": "cm",
+  "meshes": {
+    "mesh": {
+      "id": "mesh",
+      "identity": {
+        "uuid": "mesh",
+        "path": "|head|headShape",
+        "name": "headShape"
+      },
+      "vertex_count": 8,
+      "polygon_count": 2,
+      "topology_sha256": "f8635559a650871e49c3ec990dbbd680784a950c2a51da465bc8c9297e678d5f",
+      "default_positions_cm": [
+        [
+          0,
+          0,
+          0
+        ],
+        [
+          1,
+          0,
+          0
+        ],
+        [
+          1,
+          1,
+          0
+        ],
+        [
+          0,
+          1,
+          0
+        ],
+        [
+          0,
+          0,
+          0.001
+        ],
+        [
+          1,
+          0,
+          0.001
+        ],
+        [
+          1,
+          1,
+          0.001
+        ],
+        [
+          0,
+          1,
+          0.001
+        ]
+      ]
+    }
+  },
+  "joints": [
+    {
+      "joint": {
+        "uuid": "joint",
+        "path": "|rig|joint",
+        "name": "joint"
+      },
+      "parent": null,
+      "group_name": "joint_neutralVerts",
+      "default_world_position_cm": [
+        0.5,
+        0.5,
+        -2
+      ],
+      "default_local_translation_cm": [
+        0.5,
+        0.5,
+        -2
+      ],
+      "vertex_groups": [
+        {
+          "mesh_id": "mesh",
+          "vertex_ids": [
+            0,
+            1,
+            2,
+            3
+          ]
+        }
+      ],
+      "vertex_count": 4,
+      "method": "manual",
+      "review_required": false,
+      "detection_details": {},
+      "default_group_center_cm": [
+        0.5,
+        0.5,
+        0.0
+      ],
+      "offset_from_group_cm": [
+        0.0,
+        0.0,
+        -2.0
+      ]
+    }
+  ],
+  "detection_settings": {}
+}

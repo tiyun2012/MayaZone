@@ -1,0 +1,50 @@
+{
+  "version": "1.1.1",
+  "portable_and_mock_orchestration_tests": 32,
+  "tests_passed": true,
+  "qt_smoke_test": {
+    "runtime": "PySide6 6.8.3, offscreen",
+    "row_count": 331,
+    "row_selection_callbacks": true,
+    "manual_group_update": true,
+    "editable_group_name": true,
+    "filtering": true,
+    "json_save_load_round_trip": true,
+    "progress_controls_restored": true,
+    "filtered_removal_keeps_hidden_selected_rows": true,
+    "fit_target_mapping": true,
+    "preview_apply_reset_dispatch": true
+  },
+  "serialized_native_graph_check": {
+    "connected_translation_channels_checked": 977,
+    "all_channel_writers_match_original_neutral_values": true,
+    "executed_in_maya": false
+  },
+  "mock_fit_checks": [
+    "absolute fitting from saved defaults, without accumulating offsets",
+    "unmapped meshes and unassigned joint groups",
+    "vertex count mismatch rejection",
+    "row-vector matrix cells and rotated-parent local translation math",
+    "rollback after cancellation, bind failure, or verification failure",
+    "named undo chunk guard and disabled-undo rejection",
+    "upper-nose modifiers at saved defaults pass without scene writes",
+    "actual nose expressions and neck poses still reject fitting",
+    "non-neutral warnings identify connected controls and values",
+    "non-finite and out-of-range modifier values are rejected"
+  ],
+  "neutral_modifier_reference_check": {
+    "raw_indices": [53, 54],
+    "names": ["CTRL_expressions.noseWrinkleUpperL", "CTRL_expressions.noseWrinkleUpperR"],
+    "supplied_gui_values": [1.0, 1.0],
+    "condition": "All ordinary expression inputs zero, neck/head quaternions identity",
+    "comparison": "Both modifiers zero versus both modifiers one, using the original portable evaluator",
+    "joint_channels_compared": 1962,
+    "maximum_joint_channel_difference": 0.0,
+    "maximum_animated_map_difference": 0.0,
+    "executed_in_maya": false
+  },
+  "maya_runtime_tested": false,
+  "dependencies_bundled": [],
+  "scope": "Define/store vertex attachments, preview translation-only fitting, apply native neutral translations and rest geometry, refresh bind data, verify, and reset. No rotation fitting or expression coefficient adaptation.",
+  "remaining_validation": "Actual Maya scene/API evaluation, rest mesh installation, bind updates, viewport results, animation playback, and undo must be tested in a saved copy of the user scene."
+}

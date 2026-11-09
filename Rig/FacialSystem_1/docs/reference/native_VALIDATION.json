@@ -1,0 +1,19 @@
+{
+  "case_count": 1491,
+  "joint_channel_count": 1962,
+  "joint_count": 331,
+  "maximum_animated_map_error": 1.0460334531892101e-07,
+  "worst_case": "neck_target_tiltLeft_40_turnRight_65",
+  "worst_channel": "FACIAL_L_NeckB1.ry",
+  "reference": "Epic OpenRigLogic 5.8 scalar float, LOD0",
+  "maya_runtime_tested": false,
+  "maximum_translation_error_cm": 0.004268166662135364,
+  "maximum_rotation_error_degrees": 0.015245050041476915,
+  "maximum_scale_error": 7.665615342489218e-08,
+  "golden_cases_included": 107,
+  "reference_repository": "https://github.com/EpicGames/OpenRigLogic",
+  "reference_commit": "55756aca0c4c55adc56ad68a796bcc1c0bf6fa5a",
+  "reference_is_original_embedded_plugin": false,
+  "original_embedded_plugin_version": "2.10.3.6",
+  "precision_note": "Reconstruction uses double precision arithmetic; scalar reference uses float precision. Largest errors are in the quaternion RBF neck correctives."
+}
